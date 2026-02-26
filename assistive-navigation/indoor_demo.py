@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
+import os
 import random
+import shutil
+import socket
 import statistics
 import time
 import traceback
-from collections import deque
+from collections import Counter, deque
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Deque, Dict, List, Optional
@@ -46,6 +50,44 @@ def classify_distance(distance_cm: float, danger_cm: float, safe_cm: float) -> s
     if distance_cm < safe_cm:
         return WARNING
     return SAFE
+
+
+def fuse_sensor_states(sensor_states: Dict[str, str]) -> str:
+    values = set(sensor_states.values())
+    if DANGER in values:
+        return DANGER
+    if WARNING in values:
+        return WARNING
+    return SAFE
+
+
+def nearest_direction(distances: Dict[str, float]) -> str:
+    if not distances:
+        return "FRONT"
+    nearest_sensor = min(distances, key=distances.get)
+    mapping = {"front": "FRONT", "left": "LEFT", "right": "RIGHT"}
+    return mapping.get(nearest_sensor, "FRONT")
+
+
+def zone_from_x_norm(x_norm: float, left_threshold: float, right_threshold: float) -> str:
+    if x_norm < left_threshold:
+        return "LEFT"
+    if x_norm > right_threshold:
+        return "RIGHT"
+    return "FRONT"
+
+
+def zone_from_centroid_score(x_norm: float, confidence: float, margin: float) -> str:
+    x = max(0.0, min(1.0, float(x_norm)))
+    conf = max(0.0, float(confidence))
+    m = max(0.0, float(margin))
+    left_score = conf * (1.0 - x)
+    right_score = conf * x
+    if left_score > (right_score + m):
+        return "LEFT"
+    if right_score > (left_score + m):
+        return "RIGHT"
+    return "FRONT"
 
 
 class PeriodicScheduler:
@@ -499,6 +541,394 @@ class NRF24RX(RadioRX):
             return None
 
 
+class SemanticEventProvider:
+    async def get_events(self) -> List[Dict[str, Any]]:
+        return []
+
+
+class TemporalEventSmoother:
+    def __init__(self, frames: int, confidence_threshold: float) -> None:
+        self.frames = max(1, frames)
+        self.confidence_threshold = confidence_threshold
+        self.history: Deque[List[Dict[str, Any]]] = deque(maxlen=self.frames)
+
+    def update(self, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        accepted = [e for e in events if float(e.get("confidence", 0.0)) >= self.confidence_threshold]
+        self.history.append(accepted)
+
+        counts: Counter[tuple] = Counter()
+        best: Dict[tuple, Dict[str, Any]] = {}
+        for frame_events in self.history:
+            frame_seen = set()
+            for e in frame_events:
+                key = (str(e.get("label", "UNKNOWN")), str(e.get("zone", "FRONT")))
+                if key in frame_seen:
+                    continue
+                frame_seen.add(key)
+                counts[key] += 1
+                prev = best.get(key)
+                if prev is None or float(e.get("confidence", 0.0)) > float(prev.get("confidence", 0.0)):
+                    best[key] = dict(e)
+
+        min_votes = max(1, (self.frames + 1) // 2)
+        out = [best[k] for k, c in counts.items() if c >= min_votes]
+        out.sort(key=lambda e: float(e.get("confidence", 0.0)), reverse=True)
+        return out
+
+
+class MockSemanticEventProvider(SemanticEventProvider):
+    """Mock scenarios:
+    - person left -> front -> right progression
+    - flicker between zones
+    - occasional disconnect (empty events)
+    """
+
+    def __init__(self, rate_hz: float = 2.0, confidence_threshold: float = 0.5, smoothing_frames: int = 3) -> None:
+        self.tick = PeriodicScheduler(rate_hz)
+        self.step = 0
+        self.frame_id = 0
+        self.latest: List[Dict[str, Any]] = []
+        self.smoother = TemporalEventSmoother(smoothing_frames, confidence_threshold)
+
+    async def get_events(self) -> List[Dict[str, Any]]:
+        now = time.monotonic()
+        if self.tick.due(now):
+            self.tick.advance(now)
+            phase = self.step % 12
+            self.step += 1
+            self.frame_id += 1
+            ts_ms = int(time.time() * 1000)
+
+            if phase in {0, 1, 2}:
+                events = [{"label": "PERSON", "x_center_norm": 0.18, "y_center_norm": 0.55, "zone": "LEFT", "confidence": 0.82, "timestamp_ms": ts_ms, "frame_id": self.frame_id}]
+            elif phase in {3, 4, 5}:
+                events = [{"label": "PERSON", "x_center_norm": 0.50, "y_center_norm": 0.55, "zone": "FRONT", "confidence": 0.84, "timestamp_ms": ts_ms, "frame_id": self.frame_id}]
+            elif phase in {6, 7, 8}:
+                events = [{"label": "PERSON", "x_center_norm": 0.83, "y_center_norm": 0.55, "zone": "RIGHT", "confidence": 0.81, "timestamp_ms": ts_ms, "frame_id": self.frame_id}]
+            elif phase == 9:
+                # flicker
+                x_norm = random.choice([0.31, 0.34, 0.66, 0.69])
+                zone = zone_from_centroid_score(x_norm, 0.52, 0.15)
+                events = [{"label": "OBSTACLE", "x_center_norm": x_norm, "y_center_norm": 0.60, "zone": zone, "confidence": 0.52, "timestamp_ms": ts_ms, "frame_id": self.frame_id}]
+            elif phase == 10:
+                # low confidence noise
+                events = [{"label": "CHAIR", "x_center_norm": 0.48, "y_center_norm": 0.52, "zone": "FRONT", "confidence": 0.41, "timestamp_ms": ts_ms, "frame_id": self.frame_id}]
+            else:
+                # disconnect-like empty cycle
+                events = []
+
+            self.latest = self.smoother.update(events)
+
+        return self.latest
+
+
+class UDPYoloEventProvider(SemanticEventProvider):
+    """Receives JSON packets with schema:
+    {"objects":[{"label":"PERSON","x_center_norm":0.42,"y_center_norm":0.55,"zone":"LEFT|FRONT|RIGHT","confidence":0.78,"timestamp_ms":123,"frame_id":1}]}
+    """
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        confidence_threshold: float,
+        smoothing_frames: int,
+        left_threshold: float,
+        right_threshold: float,
+        direction_margin: float,
+        processing_flip: bool,
+        multi_object_threshold: int,
+        latest_frame_only: bool,
+    ) -> None:
+        self.host = host
+        self.port = int(port)
+        self.left_threshold = left_threshold
+        self.right_threshold = right_threshold
+        self.direction_margin = direction_margin
+        self.processing_flip = processing_flip
+        self.multi_object_threshold = max(2, int(multi_object_threshold))
+        self.latest_frame_only = latest_frame_only
+        self._last_frame_id = -1
+        self._stable_zone = "FRONT"
+        self._candidate_zone = "FRONT"
+        self._candidate_count = 0
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setblocking(False)
+        self.sock.bind((self.host, self.port))
+        self.latest: List[Dict[str, Any]] = []
+        self.smoother = TemporalEventSmoother(smoothing_frames, confidence_threshold)
+
+    def _normalize_obj(self, obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        cls = str(obj.get("label", obj.get("class", "UNKNOWN"))).upper()
+        conf = float(obj.get("confidence", 0.0))
+
+        x_norm = obj.get("x_center_norm")
+        y_norm = obj.get("y_center_norm")
+        zone = str(obj.get("zone", "")).upper()
+        frame_id = int(obj.get("frame_id", 0))
+        timestamp_ms = int(obj.get("timestamp_ms", int(time.time() * 1000)))
+
+        if x_norm is None:
+            pos = str(obj.get("position", "front")).lower()
+            x_norm = {"left": 0.16, "front": 0.5, "right": 0.84}.get(pos, 0.5)
+
+        try:
+            x_norm = float(x_norm)
+        except Exception:
+            x_norm = 0.5
+
+        try:
+            y_norm = float(y_norm) if y_norm is not None else 0.5
+        except Exception:
+            y_norm = 0.5
+
+        # Processing frame must remain non-mirrored (geometry-safe).
+        if self.processing_flip:
+            # still allow config but undo any accidental mirrored input by flipping x back.
+            x_norm = 1.0 - x_norm
+
+        x_norm = max(0.0, min(1.0, x_norm))
+        y_norm = max(0.0, min(1.0, y_norm))
+
+        computed_zone = zone_from_centroid_score(x_norm, conf, self.direction_margin)
+        if zone not in {"LEFT", "FRONT", "RIGHT"}:
+            zone = computed_zone
+        else:
+            zone = computed_zone
+
+        # Strict unified schema for vision events.
+        return {
+            "label": cls,
+            "x_center_norm": round(x_norm, 4),
+            "y_center_norm": round(y_norm, 4),
+            "zone": zone,
+            "confidence": round(conf, 3),
+            "timestamp_ms": timestamp_ms,
+            "frame_id": frame_id,
+        }
+
+    def _bbox_area(self, obj: Dict[str, Any]) -> float:
+        bbox = obj.get("bbox")
+        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+            try:
+                x1, y1, x2, y2 = [float(v) for v in bbox]
+                return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+            except Exception:
+                return 0.0
+        return float(obj.get("bbox_area", 0.0) or 0.0)
+
+    def _select_primary(self, objs: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not objs:
+            return None
+        ranked = sorted(
+            objs,
+            key=lambda o: (
+                -float(o.get("confidence", 0.0)),
+                -self._bbox_area(o),
+                abs(float(o.get("x_center_norm", 0.5)) - 0.5),
+            ),
+        )
+        primary = dict(ranked[0])
+        if len(objs) >= self.multi_object_threshold:
+            primary["label"] = "MULTIPLE_OBJECTS"
+        return primary
+
+    def _stabilize_zone(self, zone: str) -> str:
+        zone = zone if zone in {"LEFT", "FRONT", "RIGHT"} else "FRONT"
+        if zone == self._stable_zone:
+            self._candidate_zone = zone
+            self._candidate_count = 0
+            return self._stable_zone
+        if zone == self._candidate_zone:
+            self._candidate_count += 1
+        else:
+            self._candidate_zone = zone
+            self._candidate_count = 1
+        if self._candidate_count >= 2:
+            self._stable_zone = zone
+            self._candidate_count = 0
+        return self._stable_zone
+
+    async def get_events(self) -> List[Dict[str, Any]]:
+        latest_data: Optional[bytes] = None
+        try:
+            while True:
+                data, _ = self.sock.recvfrom(4096)
+                latest_data = data
+                if not self.latest_frame_only:
+                    break
+        except BlockingIOError:
+            if latest_data is None:
+                return self.latest
+        except Exception:
+            return self.latest
+
+        try:
+            payload = json.loads((latest_data or b"{}").decode("utf-8"))
+            frame_id = int(payload.get("frame_id", 0))
+            if self.latest_frame_only and frame_id <= self._last_frame_id:
+                return self.latest
+            if frame_id > 0:
+                self._last_frame_id = frame_id
+            objects = payload.get("objects", [])
+            if isinstance(objects, list):
+                normalized = []
+                for obj in objects:
+                    if not isinstance(obj, dict):
+                        continue
+                    n = self._normalize_obj(obj)
+                    if n is not None:
+                        normalized.append(n)
+                primary = self._select_primary(normalized)
+                if primary is None:
+                    self.latest = []
+                else:
+                    primary["zone"] = self._stabilize_zone(str(primary.get("zone", "FRONT")))
+                    self.latest = self.smoother.update([primary])
+        except Exception:
+            pass
+        return self.latest
+
+
+class IndoorAudioAnnouncer:
+    def __init__(
+        self,
+        enabled: bool,
+        folder: str,
+        cooldown_ms: int,
+        confidence_threshold: float,
+    ) -> None:
+        self.enabled = enabled
+        self.folder = folder
+        self.repeat_ms = max(1000, int(cooldown_ms))
+        self.active_timeout_ms = 1500
+        self.confidence_threshold = float(confidence_threshold)
+        self.current_object: Optional[str] = None
+        self.last_spoken_time = 0
+        self.last_frame_id = -1
+        self.active_object_timer = 0
+        self._proc: Optional[asyncio.subprocess.Process] = None
+        self._file_map = {
+            "PERSON": "person.mp3",
+            "CHAIR": "chair.mp3",
+            "TABLE": "table.mp3",
+            "CAR": "car.mp3",
+            "MULTIPLE_OBJECTS": "multiple_objects.mp3",
+        }
+        self._priority = {
+            "PERSON": 4,
+            "CHAIR": 3,
+            "TABLE": 2,
+            "MULTIPLE_OBJECTS": 1,
+        }
+
+    def _resolve_audio_path(self, key: str) -> Optional[str]:
+        fn = self._file_map.get(key)
+        if not fn:
+            return None
+        path = os.path.join(self.folder, fn)
+        return path if os.path.exists(path) else None
+
+    async def start(self) -> None:
+        return
+
+    async def stop(self) -> None:
+        await self.interrupt()
+
+    async def interrupt(self) -> None:
+        if self._proc and self._proc.returncode is None:
+            self._proc.terminate()
+            try:
+                await asyncio.wait_for(self._proc.wait(), timeout=0.2)
+            except Exception:
+                self._proc.kill()
+                with contextlib.suppress(Exception):
+                    await self._proc.wait()
+        self._proc = None
+
+    async def _speak(self, key: str) -> None:
+        path = self._resolve_audio_path(key)
+        if path is None:
+            print(f"[Audio] Missing file for {key} in {self.folder}")
+            return
+
+        await self.interrupt()
+        player = None
+        if shutil.which("afplay"):
+            player = ["afplay", path]
+        elif shutil.which("ffplay"):
+            player = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path]
+        elif shutil.which("mpg123"):
+            player = ["mpg123", "-q", path]
+        try:
+            if player is None:
+                print(f"[Audio] No player found; simulated: {key}")
+                await asyncio.sleep(0.15)
+            else:
+                self._proc = await asyncio.create_subprocess_exec(
+                    *player,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+        except Exception as exc:
+            print(f"[Audio] playback error: {exc}")
+            self._proc = None
+
+    def _is_higher_priority(self, new_key: str, old_key: Optional[str]) -> bool:
+        if old_key is None:
+            return True
+        return self._priority.get(new_key, 0) >= self._priority.get(old_key, 0)
+
+    async def process(
+        self,
+        *,
+        detected_key: Optional[str],
+        frame_id: int,
+        confidence: float,
+        suppress: bool,
+    ) -> None:
+        if not self.enabled:
+            return
+        now_ms = int(time.time() * 1000)
+
+        if suppress:
+            await self.interrupt()
+            self.current_object = None
+            self.active_object_timer = 0
+            return
+
+        # Reset active state when object vanished.
+        if self.current_object and (now_ms - self.active_object_timer) > self.active_timeout_ms:
+            self.current_object = None
+
+        key = detected_key.upper() if detected_key else None
+        has_valid_detection = bool(key) and float(confidence) >= self.confidence_threshold
+        has_new_frame = frame_id > self.last_frame_id
+
+        if has_valid_detection and has_new_frame:
+            self.last_frame_id = frame_id
+            self.active_object_timer = now_ms
+            if key != self.current_object:
+                # New event interrupts immediately (single active channel rule).
+                if key:
+                    self.current_object = key
+                    await self._speak(key)
+                    self.last_spoken_time = now_ms
+                    return
+            else:
+                # Same object, repeat every 1 second while persistent.
+                if (now_ms - self.last_spoken_time) >= self.repeat_ms:
+                    await self._speak(key)
+                    self.last_spoken_time = now_ms
+                    return
+
+        # Continue repeating for persistent object while detections keep it active.
+        if self.current_object and (now_ms - self.active_object_timer) <= self.active_timeout_ms:
+            if (now_ms - self.last_spoken_time) >= self.repeat_ms:
+                await self._speak(self.current_object)
+                self.last_spoken_time = now_ms
+
+
 class _SSD1306Adapter:
     def __init__(self, cfg: Dict[str, Any]) -> None:
         self.cfg = cfg
@@ -684,6 +1114,30 @@ def _debug(enabled: bool, event: str, **fields: Any) -> None:
     print(f"[DEBUG] {json.dumps(payload, separators=(',', ':'))}")
 
 
+def select_audio_event(
+    events: List[Dict[str, Any]],
+    multi_object_threshold: int,
+    confidence_threshold: float,
+) -> tuple[Optional[str], int, float]:
+    valid = [e for e in events if float(e.get("confidence", 0.0)) >= confidence_threshold]
+    if not valid:
+        return None, -1, 0.0
+    frame_id = max(int(e.get("frame_id", -1)) for e in valid)
+    if len(valid) >= max(2, multi_object_threshold):
+        conf = max(float(e.get("confidence", 0.0)) for e in valid)
+        return "MULTIPLE_OBJECTS", frame_id, conf
+
+    priority = {"PERSON": 4, "CHAIR": 3, "TABLE": 2, "MULTIPLE_OBJECTS": 1}
+    best = sorted(
+        valid,
+        key=lambda e: (
+            -priority.get(str(e.get("label", "")).upper(), 0),
+            -float(e.get("confidence", 0.0)),
+        ),
+    )[0]
+    return str(best.get("label", "")).upper(), int(best.get("frame_id", frame_id)), float(best.get("confidence", 0.0))
+
+
 async def sensor_node_loop(
     sensor_provider: UltrasonicSensorProvider,
     tx: RadioTX,
@@ -696,10 +1150,13 @@ async def sensor_node_loop(
     max_range_cm: float,
     hysteresis_cm: float,
     debounce_ticks: int,
+    raw_samples_per_tick: int,
+    ema_alpha: float,
     debug_enabled: bool,
 ) -> None:
     filt = DistanceFilter(max_range_cm=max_range_cm, window=3, mode=filter_mode)
-    stabilizer = StateStabilizer(hysteresis_cm=hysteresis_cm, debounce_ticks=debounce_ticks)
+    stabilizers = {name: StateStabilizer(hysteresis_cm=hysteresis_cm, debounce_ticks=debounce_ticks) for name in sensor_names}
+    ema_prev: Dict[str, float] = {}
     sensor_tick = PeriodicScheduler(sensor_hz)
     radio_tick = PeriodicScheduler(radio_hz)
 
@@ -711,25 +1168,33 @@ async def sensor_node_loop(
         if sensor_tick.due(now):
             filtered: Dict[str, float] = {}
             for name in sensor_names:
-                try:
-                    raw = await sensor_provider.read_distance_cm(name)
-                except Exception:
-                    raw = None
-                v = filt.update(name, raw)
+                for _ in range(max(1, raw_samples_per_tick)):
+                    try:
+                        raw = await sensor_provider.read_distance_cm(name)
+                    except Exception:
+                        raw = None
+                    filt.update(name, raw)
+                v = filt.current(name)
                 if v is not None:
-                    filtered[name] = round(v, 1)
+                    prev = ema_prev.get(name, v)
+                    ema = (ema_alpha * v) + ((1.0 - ema_alpha) * prev)
+                    ema_prev[name] = ema
+                    filtered[name] = round(ema, 1)
 
-            nearest = min(filtered.values()) if filtered else None
-            state = stabilizer.update(nearest, danger_cm=danger_cm, safe_cm=safe_cm)
+            sensor_states: Dict[str, str] = {}
+            for name in sensor_names:
+                sensor_states[name] = stabilizers[name].update(filtered.get(name), danger_cm=danger_cm, safe_cm=safe_cm)
+            state = fuse_sensor_states(sensor_states)
 
             if len(sensor_names) == 1:
+                nearest = filtered.get(sensor_names[0])
                 dist = round(nearest, 1) if nearest is not None else round(safe_cm, 1)
                 latest_packet = IndoorPacket(state=state, distance=dist).to_wire()
             else:
                 dist_map = filtered if filtered else {name: round(safe_cm, 1) for name in sensor_names}
                 latest_packet = IndoorPacket(state=state, distances=dist_map).to_wire()
 
-            _debug(debug_enabled, "sensor_tick", nearest=nearest, state=state, packet=latest_packet)
+            _debug(debug_enabled, "sensor_tick", distances=filtered, sensor_states=sensor_states, state=state, packet=latest_packet)
             sensor_tick.advance(now)
 
         now = time.monotonic()
@@ -748,6 +1213,7 @@ async def sensor_node_loop(
 
 async def receiver_node_loop(
     rx: RadioRX,
+    semantic_provider: Optional[SemanticEventProvider],
     display_backend: str,
     display_cfg: Dict[str, Any],
     buzzer_backend: str,
@@ -755,11 +1221,24 @@ async def receiver_node_loop(
     radio_hz: float,
     ui_hz: float,
     no_signal_timeout_sec: float,
+    max_event_age_ms: int,
+    audio_enabled: bool,
+    audio_folder: str,
+    audio_cooldown_ms: int,
+    multi_object_threshold: int,
+    audio_confidence_threshold: float,
     debug_enabled: bool,
 ) -> None:
     ui = ReceiverUI(backend=display_backend, display_cfg=display_cfg)
     buzzer = BuzzerController(backend=buzzer_backend, buzzer_cfg=buzzer_cfg)
+    announcer = IndoorAudioAnnouncer(
+        enabled=audio_enabled,
+        folder=audio_folder,
+        cooldown_ms=audio_cooldown_ms,
+        confidence_threshold=audio_confidence_threshold,
+    )
     await buzzer.start()
+    await announcer.start()
 
     radio_tick = PeriodicScheduler(radio_hz)
     ui_tick = PeriodicScheduler(ui_hz)
@@ -767,6 +1246,7 @@ async def receiver_node_loop(
     last_packet_at = time.monotonic()
     latest_packet: Optional[Dict[str, object]] = None
     latest_state = SAFE
+    latest_events: List[Dict[str, Any]] = []
 
     try:
         while True:
@@ -783,6 +1263,9 @@ async def receiver_node_loop(
                     latest_state = str(packet["state"])
                     last_packet_at = now
                     buzzer.set_state(latest_state)
+                    if latest_state == DANGER:
+                        await announcer.interrupt()
+                        announcer.set_visible_key(None)
                     _debug(debug_enabled, "radio_rx_tick", status="ok", state=latest_state)
                 elif packet is not None:
                     _debug(debug_enabled, "radio_rx_tick", status="invalid_packet")
@@ -793,26 +1276,78 @@ async def receiver_node_loop(
 
             now = time.monotonic()
             if ui_tick.due(now):
+                if semantic_provider is not None:
+                    try:
+                        latest_events = await semantic_provider.get_events()
+                    except Exception:
+                        latest_events = []
+                now_ms = int(time.time() * 1000)
+                latest_events = [
+                    e
+                    for e in latest_events
+                    if isinstance(e, dict) and (now_ms - int(e.get("timestamp_ms", now_ms))) <= max_event_age_ms
+                ]
+
                 if now - last_packet_at >= no_signal_timeout_sec:
+                    await announcer.process(detected_key=None, frame_id=-1, confidence=0.0, suppress=False)
                     await ui.render("NO SIGNAL")
                     buzzer.set_state(SAFE)
                     _debug(debug_enabled, "ui_tick", view="NO SIGNAL")
                 else:
                     if latest_packet is None:
-                        await ui.render("CLEAR")
+                        await ui.render("SAFE")
                     else:
-                        text = "CLEAR" if latest_state == SAFE else ("OBJECT NEAR" if latest_state == WARNING else "STOP")
+                        # Ultrasonic direction always authoritative.
+                        us_dir = nearest_direction(latest_packet.get("distances", {})) if "distances" in latest_packet else "FRONT"
+
+                        if latest_state == DANGER:
+                            await announcer.interrupt()
+                            await announcer.process(detected_key=None, frame_id=-1, confidence=0.0, suppress=True)
+                            text = f"DANGER {us_dir}"
+                        elif latest_state == WARNING:
+                            text = f"WARNING {us_dir}"
+                            if latest_events:
+                                # YOLO only adds semantic label.
+                                top = max(latest_events, key=lambda x: float(x.get("confidence", 0.0)))
+                                text = f"WARNING {str(top.get('label', 'OBJECT')).upper()} {us_dir}"
+                        else:
+                            text = "SAFE"
+
                         if "distance" in latest_packet:
                             sub = f"{latest_packet['distance']} cm"
                         else:
                             sub = str(latest_packet.get("distances", {}))
                         await ui.render(text, sub)
-                        _debug(debug_enabled, "ui_tick", view=text, state=latest_state)
+                        announce_key, announce_frame_id, announce_conf = select_audio_event(
+                            latest_events,
+                            multi_object_threshold=multi_object_threshold,
+                            confidence_threshold=audio_confidence_threshold,
+                        )
+                        await announcer.process(
+                            detected_key=announce_key if latest_state != DANGER else None,
+                            frame_id=announce_frame_id,
+                            confidence=announce_conf,
+                            suppress=(latest_state == DANGER),
+                        )
+
+                        top_frame = int(latest_events[0].get("frame_id", -1)) if latest_events else -1
+                        _debug(
+                            debug_enabled,
+                            "fusion_decision",
+                            frame_id=top_frame,
+                            timestamp_ms=int(time.time() * 1000),
+                            state=latest_state,
+                            view=text,
+                            reason="ultrasonic_override" if latest_state in {WARNING, DANGER} else "vision_or_clear",
+                            yolo_events=latest_events,
+                            audio_key=announce_key,
+                        )
                 ui_tick.advance(now)
 
             sleep_for = _sleep_to_next(time.monotonic(), [radio_tick, ui_tick])
             await asyncio.sleep(sleep_for)
     finally:
+        await announcer.stop()
         await buzzer.stop()
 
 
@@ -829,6 +1364,11 @@ async def run(args: argparse.Namespace) -> None:
     buzzer_cfg = hw.get("buzzer", {})
     thresholds = hw.get("thresholds_cm", {})
     runtime_cfg = hw.get("runtime", {})
+    yolo_cfg = hw.get("yolo", {})
+    direction_cfg = hw.get("direction", {})
+    camera_cfg = hw.get("camera", {})
+    vision_cfg = hw.get("vision", {})
+    audio_cfg = hw.get("audio", {})
 
     role = str(get_arg(args, "role", "both")).lower()
     sensor_count = int(get_arg(args, "sensor_count", sensor_cfg.get("count", 1)))
@@ -847,6 +1387,20 @@ async def run(args: argparse.Namespace) -> None:
     debounce_ticks = int(runtime_cfg.get("state_debounce_ticks", 2))
     no_signal_timeout_sec = float(runtime_cfg.get("rx_no_signal_timeout_sec", 1.0))
     debug_enabled = bool(runtime_cfg.get("debug_enabled", False))
+    max_event_age_ms = int(vision_cfg.get("max_event_age_ms", 1500))
+    latest_frame_only = bool(vision_cfg.get("latest_frame_only", True))
+
+    audio_enabled = bool(audio_cfg.get("enabled", True))
+    audio_folder = str(audio_cfg.get("folder", "indoor_audio"))
+    if not os.path.isabs(audio_folder):
+        audio_folder = os.path.join(os.path.dirname(__file__), audio_folder)
+    audio_cooldown_ms = int(audio_cfg.get("cooldown_ms", 1000))
+    multi_object_threshold = int(audio_cfg.get("multi_object_threshold", 2))
+    audio_confidence_threshold = float(audio_cfg.get("confidence_threshold", yolo_cfg.get("confidence_threshold", 0.5)))
+
+    raw_samples_per_tick = int(sensor_cfg.get("raw_samples_per_tick", 3))
+    ema_alpha = float(sensor_cfg.get("ema_alpha", 0.4))
+    ema_alpha = max(0.0, min(1.0, ema_alpha))
 
     names = ["front", "left", "right"][: max(1, min(3, sensor_count))]
 
@@ -869,6 +1423,40 @@ async def run(args: argparse.Namespace) -> None:
     else:
         raise ValueError(f"Unknown radio backend in hardware_config.py: {radio_backend}")
 
+    semantic_provider: Optional[SemanticEventProvider] = None
+    if bool(yolo_cfg.get("enabled", False)):
+        yolo_backend = str(yolo_cfg.get("backend", "mock")).lower()
+        confidence_threshold = float(yolo_cfg.get("confidence_threshold", 0.5))
+        smoothing_frames = int(yolo_cfg.get("temporal_smoothing_frames", vision_cfg.get("smoothing_window", 3)))
+        left_threshold = float(direction_cfg.get("left_threshold", 0.33))
+        right_threshold = float(direction_cfg.get("right_threshold", 0.66))
+        direction_margin = float(vision_cfg.get("direction_margin", 0.15))
+        processing_flip = bool(camera_cfg.get("flip_for_processing", False))
+        if processing_flip:
+            print("[Vision] FRAME MIRRORING VIOLATION: inference pipeline configured as mirrored")
+
+        if yolo_backend == "mock":
+            semantic_provider = MockSemanticEventProvider(
+                rate_hz=float(yolo_cfg.get("mock_rate_hz", 2.0)),
+                confidence_threshold=confidence_threshold,
+                smoothing_frames=smoothing_frames,
+            )
+        elif yolo_backend == "udp":
+            semantic_provider = UDPYoloEventProvider(
+                host=str(yolo_cfg.get("udp_host", "0.0.0.0")),
+                port=int(yolo_cfg.get("udp_port", 5005)),
+                confidence_threshold=confidence_threshold,
+                smoothing_frames=smoothing_frames,
+                left_threshold=left_threshold,
+                right_threshold=right_threshold,
+                direction_margin=direction_margin,
+                processing_flip=processing_flip,
+                multi_object_threshold=multi_object_threshold,
+                latest_frame_only=latest_frame_only,
+            )
+        else:
+            print(f"[YOLO] Unknown backend '{yolo_backend}', disabled")
+
     display_backend = str(backend_cfg.get("display", "console")).lower()
     buzzer_backend = str(backend_cfg.get("buzzer", "console")).lower()
 
@@ -889,6 +1477,8 @@ async def run(args: argparse.Namespace) -> None:
                         max_range_cm=max_range_cm,
                         hysteresis_cm=hysteresis_cm,
                         debounce_ticks=debounce_ticks,
+                        raw_samples_per_tick=raw_samples_per_tick,
+                        ema_alpha=ema_alpha,
                         debug_enabled=debug_enabled,
                     ),
                     name="indoor-sensor-node",
@@ -900,6 +1490,7 @@ async def run(args: argparse.Namespace) -> None:
                 asyncio.create_task(
                     receiver_node_loop(
                         rx=rx,
+                        semantic_provider=semantic_provider,
                         display_backend=display_backend,
                         display_cfg=display_cfg,
                         buzzer_backend=buzzer_backend,
@@ -907,6 +1498,12 @@ async def run(args: argparse.Namespace) -> None:
                         radio_hz=radio_hz,
                         ui_hz=ui_hz,
                         no_signal_timeout_sec=no_signal_timeout_sec,
+                        max_event_age_ms=max_event_age_ms,
+                        audio_enabled=audio_enabled,
+                        audio_folder=audio_folder,
+                        audio_cooldown_ms=audio_cooldown_ms,
+                        multi_object_threshold=multi_object_threshold,
+                        audio_confidence_threshold=audio_confidence_threshold,
                         debug_enabled=debug_enabled,
                     ),
                     name="indoor-receiver-node",
