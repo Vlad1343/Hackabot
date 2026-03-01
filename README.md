@@ -150,11 +150,11 @@ Stepwise is designed for unstable real-world conditions:
 ## Project Gallery
 
 <p align="center">
-	<img src="photos/1.png" alt="Stepwise Prototype 1" width="250" />
+	<img src="photos/1.png" alt="Stepwise Prototype 1" width="400" />
 </p>
 
 <p align="center">
-	<img src="photos/2.png" alt="Stepwise Prototype 2" width="250" />
+	<img src="photos/2.png" alt="Stepwise Prototype 2" width="400" />
 </p>
 
 <p align="center">
