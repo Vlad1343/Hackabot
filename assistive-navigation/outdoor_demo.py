@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import time
 import traceback
 
 import cv2
@@ -34,6 +36,21 @@ def event_to_audio_key(
     if is_multiple:
         return f"several_{label}_{direction}", 2, f"several:{label}:{direction}", cooldowns["several_sec"]
     return f"{label}_{direction}", 2, f"{label}:{direction}", cooldowns["default_sec"]
+
+
+def select_primary_event(events: list, direction_margin: float):
+    if not events:
+        return None
+    # Priority: confidence, bbox area, center closeness.
+    ranked = sorted(
+        events,
+        key=lambda ev: (
+            -float(getattr(ev, "confidence", 0.0)),
+            -float(max(0, ev.bbox[2] - ev.bbox[0]) * max(0, ev.bbox[3] - ev.bbox[1])),
+            abs((((ev.bbox[0] + ev.bbox[2]) / 2.0) / 640.0) - 0.5),
+        ),
+    )
+    return ranked[0]
 
 
 async def run(args: argparse.Namespace) -> None:
@@ -64,11 +81,18 @@ async def run(args: argparse.Namespace) -> None:
 
     detection_interval = float(args.detection_interval or config["app"]["detection_interval_sec"])
     show_overlay = bool(args.show_overlay or config["app"].get("show_overlay", False))
+    vision_cfg = config.get("vision", {})
+    max_event_age_ms = int(vision_cfg.get("max_event_age_ms", 1500))
+    process_timeout_ms = int(vision_cfg.get("max_processing_ms", 220))
+    direction_margin = float(vision_cfg.get("direction_margin", 0.15))
+    # Processing frame must stay non-mirrored for direction correctness.
+    flip_for_processing = False
+    camera_cfg = config.get("camera", {})
     if getattr(args, "mirror_input", None) is not None:
-        flip_camera = bool(args.mirror_input)
+        flip_for_display = bool(args.mirror_input)
     else:
-        base_mirror = bool(config["app"].get("mirror_input_outdoor", config["app"].get("mirror_input", True)))
-        flip_camera = base_mirror and not bool(args.no_flip)
+        base_mirror = bool(camera_cfg.get("flip_for_display", config["app"].get("mirror_input_outdoor", config["app"].get("mirror_input", True))))
+        flip_for_display = base_mirror and not bool(args.no_flip)
 
     try:
         last_detection = 0.0
@@ -78,28 +102,80 @@ async def run(args: argparse.Namespace) -> None:
             if frame is None:
                 await asyncio.sleep(0.03)
                 continue
-            if flip_camera:
-                frame = cv2.flip(frame, 1)
+            processing_frame = frame if not flip_for_processing else cv2.flip(frame, 1)
+            user_frame = cv2.flip(frame, 1) if flip_for_display else frame.copy()
+            if flip_for_processing:
+                print("[Vision] FRAME MIRRORING VIOLATION: inference frame must be non-mirrored")
+            if show_overlay and not flip_for_display:
+                print("[Vision] FRAME MIRRORING VIOLATION: user display expected mirrored in UI mode")
 
             now = asyncio.get_running_loop().time()
             if now - last_detection >= detection_interval:
                 last_detection = now
-                events, last_debug_dets = detection.detect(frame, mode="outdoor")
-                for ev in events:
-                    requires_stability = ev.label != "traffic_light"
-                    if requires_stability and not gate.allow(ev, now):
-                        continue
-                    key, priority, cooldown_key, cooldown_sec = event_to_audio_key(
-                        ev.label, ev.direction, ev.is_multiple, ev.risk_level, config
+                try:
+                    events, last_debug_dets = await asyncio.wait_for(
+                        asyncio.to_thread(detection.detect, processing_frame, "outdoor", is_mirrored=False),
+                        timeout=max(0.05, process_timeout_ms / 1000.0),
                     )
-                    audio.enqueue(
-                        key=key,
-                        mode="outdoor",
-                        priority=priority,
-                        cooldown_key=cooldown_key,
-                        cooldown_sec=cooldown_sec,
-                        reason=f"det:{ev.label}:{ev.direction}:count={ev.count}:risk={ev.risk_level}",
+                except asyncio.TimeoutError:
+                    print("[Vision] detection skipped: processing timeout")
+                    events, last_debug_dets = [], []
+                now_ms = int(time.time() * 1000)
+                stale_cutoff_ms = now_ms - max_event_age_ms
+                schema_events = [
+                    {
+                        "label": str(d["label"]).upper(),
+                        "x_center_norm": float(d["x_center_norm"]),
+                        "y_center_norm": float(d["y_center_norm"]),
+                        "zone": str(d["zone"]).upper(),
+                        "confidence": float(d["confidence"]),
+                        "timestamp_ms": int(d["timestamp_ms"]),
+                        "frame_id": int(d["frame_id"]),
+                    }
+                    for d in last_debug_dets
+                    if int(d.get("timestamp_ms", 0)) >= stale_cutoff_ms
+                ]
+                print(
+                    "[VisionSchema] "
+                    + json.dumps(
+                        {
+                            "frame_id": int(schema_events[0]["frame_id"]) if schema_events else -1,
+                            "timestamp_ms": int(schema_events[0]["timestamp_ms"]) if schema_events else 0,
+                            "objects": schema_events,
+                        },
+                        separators=(",", ":"),
                     )
+                )
+                primary = select_primary_event(events, direction_margin=direction_margin)
+                if primary is not None:
+                    zone = {"left": "LEFT", "right": "RIGHT", "ahead": "FRONT"}.get(primary.direction, "FRONT")
+                    matched = next((d for d in schema_events if d["label"] == str(primary.label).upper() and d["zone"] == zone), None)
+                    if matched is not None:
+                        requires_stability = primary.label != "traffic_light"
+                        if (not requires_stability) or gate.allow(primary, now):
+                            key, priority, cooldown_key, cooldown_sec = event_to_audio_key(
+                                primary.label, primary.direction, primary.is_multiple, primary.risk_level, config
+                            )
+                            audio.enqueue(
+                                key=key,
+                                mode="outdoor",
+                                priority=priority,
+                                cooldown_key=cooldown_key,
+                                cooldown_sec=cooldown_sec,
+                                reason=f"det:{primary.label}:{primary.direction}:count={primary.count}:risk={primary.risk_level}",
+                            )
+                            print(
+                                "[FusionDecision] "
+                                + json.dumps(
+                                    {
+                                        "frame_id": int(matched.get("frame_id", -1)),
+                                        "timestamp_ms": int(matched.get("timestamp_ms", 0)),
+                                        "reason": f"det:{primary.label}:{primary.direction}",
+                                        "audio_key": key,
+                                    },
+                                    separators=(",", ":"),
+                                )
+                            )
 
             if sensor:
                 sensor_ev = await sensor.read()
@@ -138,8 +214,10 @@ async def run(args: argparse.Namespace) -> None:
                 )
 
             if show_overlay:
-                out = draw_debug_overlay(frame, last_debug_dets)
-                cv2.imshow("HACKABOT Outdoor Demo", out)
+                raw_out = draw_debug_overlay(processing_frame.copy(), last_debug_dets)
+                user_out = draw_debug_overlay(user_frame, last_debug_dets)
+                cv2.imshow("HACKABOT Outdoor RAW (Not Mirrored)", raw_out)
+                cv2.imshow("HACKABOT Outdoor USER VIEW", user_out)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
 
@@ -164,9 +242,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--camera", type=int, default=0, help="Webcam index")
     p.add_argument("--video", type=str, default="", help="Optional prerecorded video path")
     p.add_argument("--show-overlay", action="store_true", help="Show OpenCV overlay")
-    p.add_argument("--no-flip", action="store_true", help="Disable default horizontal camera flip")
-    p.add_argument("--mirror-input", dest="mirror_input", action="store_true", default=None, help="Force mirrored camera input")
-    p.add_argument("--no-mirror-input", dest="mirror_input", action="store_false", help="Force non-mirrored camera input")
+    p.add_argument("--no-flip", action="store_true", help="Disable mirrored USER VIEW window")
+    p.add_argument("--mirror-input", dest="mirror_input", action="store_true", default=None, help="Mirror USER VIEW window (inference stays non-mirrored)")
+    p.add_argument("--no-mirror-input", dest="mirror_input", action="store_false", help="Do not mirror USER VIEW window")
     p.add_argument("--keyboard-sensor", action="store_true", help="Enable keyboard distance sensor (O/C)")
     p.add_argument("--simulate-obstacles", action="store_true", help="Enable synthetic obstacle events")
     p.add_argument("--simulate-navigation", action="store_true", help="Enable synthetic nav messages")
