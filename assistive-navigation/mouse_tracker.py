@@ -94,6 +94,36 @@ def parse_args() -> argparse.Namespace:
         choices=["csrt", "kcf", "mil"],
         help="Tracker backend for --auto-track",
     )
+    parser.add_argument(
+        "--max-shift-ratio",
+        type=float,
+        default=0.35,
+        help="Max allowed center shift per frame as ratio of last box size (lower = less drift)",
+    )
+    parser.add_argument(
+        "--max-area-change",
+        type=float,
+        default=2.5,
+        help="Max allowed area growth/shrink factor per frame for auto-track (e.g. 2.5)",
+    )
+    parser.add_argument(
+        "--pred-alpha",
+        type=float,
+        default=0.65,
+        help="Blend for measured center vs predicted center (0..1)",
+    )
+    parser.add_argument(
+        "--pred-beta",
+        type=float,
+        default=0.50,
+        help="Blend for measured size vs predicted size (0..1)",
+    )
+    parser.add_argument(
+        "--vel-gamma",
+        type=float,
+        default=0.60,
+        help="Velocity smoothing factor (0..1), higher = smoother/slower change",
+    )
     parser.add_argument("--resume", action="store_true", help="Resume from existing output file")
     return parser.parse_args()
 
@@ -288,8 +318,17 @@ def _tracker_ctor(name: str):
 
 def init_trackers(frame, boxes: List[dict], tracker_type: str):
     ctor = _tracker_ctor(tracker_type)
+    chosen = tracker_type
     if ctor is None:
-        print(f"[Track] Tracker '{tracker_type}' is not available in this OpenCV build")
+        # Auto-fallback so --auto-track still works on limited OpenCV builds.
+        for alt in ("kcf", "mil"):
+            ctor = _tracker_ctor(alt)
+            if ctor is not None:
+                chosen = alt
+                print(f"[Track] Tracker '{tracker_type}' unavailable; falling back to '{alt}'")
+                break
+    if ctor is None:
+        print(f"[Track] No supported tracker backend available (tried: {tracker_type}, kcf, mil)")
         return []
 
     trackers = []
@@ -312,18 +351,30 @@ def init_trackers(frame, boxes: List[dict], tracker_type: str):
                     "class": box.get("class", "object"),
                     "missed": 0,
                     "last_box": make_record(str(box.get("class", "object")), x1, y1, x2, y2),
+                    "velocity": (0.0, 0.0),  # center delta per frame (smoothed)
                 }
             )
         else:
             print(f"[Track] init failed for class={box.get('class', 'object')} box=({x1},{y1},{x2},{y2})")
-    print(f"[Track] Initialized {len(trackers)} tracker(s)")
+    print(f"[Track] Initialized {len(trackers)} tracker(s) with backend '{chosen}'")
     return trackers
 
 
-def predict_boxes_from_trackers(frame, trackers: List[dict]) -> List[dict]:
+def predict_boxes_from_trackers(
+    frame,
+    trackers: List[dict],
+    max_shift_ratio: float,
+    max_area_change: float,
+    pred_alpha: float,
+    pred_beta: float,
+    vel_gamma: float,
+) -> List[dict]:
     predicted: List[dict] = []
     alive = []
     max_missed = 5
+    alpha = max(0.0, min(1.0, float(pred_alpha)))
+    beta = max(0.0, min(1.0, float(pred_beta)))
+    gamma = max(0.0, min(1.0, float(vel_gamma)))
     for t in trackers:
         tr = t["tracker"]
         cls = t["class"]
@@ -338,16 +389,69 @@ def predict_boxes_from_trackers(frame, trackers: List[dict]) -> List[dict]:
             x2, y2 = int(x + w), int(y + h)
             if x2 > x1 and y2 > y1:
                 rec = make_record(str(cls), x1, y1, x2, y2)
-                t["last_box"] = rec
-                t["missed"] = 0
-                predicted.append(rec)
-                alive.append(t)
-                continue
+                last_box = t.get("last_box")
+                # Drift guard: reject sudden side jumps/size explosions between adjacent frames.
+                if isinstance(last_box, dict):
+                    lx1, ly1, lx2, ly2 = int(last_box["x1"]), int(last_box["y1"]), int(last_box["x2"]), int(last_box["y2"])
+                    lw, lh = max(1, lx2 - lx1), max(1, ly2 - ly1)
+                    lcx, lcy = lx1 + lw / 2.0, ly1 + lh / 2.0
+                    ncx, ncy = rec["x1"] + rec["w"] / 2.0, rec["y1"] + rec["h"] / 2.0
+                    vx, vy = t.get("velocity", (0.0, 0.0))
+                    exp_cx, exp_cy = lcx + float(vx), lcy + float(vy)
+                    # Predict + fuse (center, size) using previous motion.
+                    pred_w, pred_h = lw, lh
+                    fused_cx = alpha * ncx + (1.0 - alpha) * exp_cx
+                    fused_cy = alpha * ncy + (1.0 - alpha) * exp_cy
+                    fw = int(round(beta * rec["w"] + (1.0 - beta) * pred_w))
+                    fh = int(round(beta * rec["h"] + (1.0 - beta) * pred_h))
+                    fw, fh = max(1, fw), max(1, fh)
+                    rec = make_record(
+                        str(cls),
+                        int(round(fused_cx - fw / 2.0)),
+                        int(round(fused_cy - fh / 2.0)),
+                        int(round(fused_cx + fw / 2.0)),
+                        int(round(fused_cy + fh / 2.0)),
+                    )
+                    ncx, ncy = rec["x1"] + rec["w"] / 2.0, rec["y1"] + rec["h"] / 2.0
+                    dx, dy = abs(ncx - lcx), abs(ncy - lcy)
+                    max_shift_px = max(6.0, float(max_shift_ratio) * max(lw, lh))
+                    la = max(1.0, float(lw * lh))
+                    na = max(1.0, float(rec["w"] * rec["h"]))
+                    area_factor = max(na / la, la / na)
+                    if dx > max_shift_px or dy > (max_shift_px * 0.9) or area_factor > float(max_area_change):
+                        ok = False
+                if ok:
+                    if isinstance(last_box, dict):
+                        lcx = int(last_box["x1"]) + int(last_box["w"]) / 2.0
+                        lcy = int(last_box["y1"]) + int(last_box["h"]) / 2.0
+                        ncx = int(rec["x1"]) + int(rec["w"]) / 2.0
+                        ncy = int(rec["y1"]) + int(rec["h"]) / 2.0
+                        prev_vx, prev_vy = t.get("velocity", (0.0, 0.0))
+                        # Smooth velocity from recent box movement.
+                        t["velocity"] = (
+                            (gamma * float(prev_vx)) + ((1.0 - gamma) * float(ncx - lcx)),
+                            (gamma * float(prev_vy)) + ((1.0 - gamma) * float(ncy - lcy)),
+                        )
+                    t["last_box"] = rec
+                    t["missed"] = 0
+                    predicted.append(rec)
+                    alive.append(t)
+                    continue
 
         # Keep tracker briefly alive on temporary misses (motion blur/occlusion).
         t["missed"] = int(t.get("missed", 0)) + 1
         if t["missed"] <= max_missed and t.get("last_box") is not None:
-            predicted.append(dict(t["last_box"]))
+            lb = dict(t["last_box"])
+            # On temporary miss, extrapolate using motion velocity.
+            vx, vy = t.get("velocity", (0.0, 0.0))
+            if lb.get("w", 0) > 0 and lb.get("h", 0) > 0:
+                x1 = int(lb["x1"] + vx)
+                y1 = int(lb["y1"] + vy)
+                x2 = int(lb["x2"] + vx)
+                y2 = int(lb["y2"] + vy)
+                lb = make_record(str(lb.get("class", cls)), x1, y1, x2, y2)
+                t["last_box"] = lb
+            predicted.append(lb)
             alive.append(t)
     trackers[:] = alive
     return predicted
@@ -505,11 +609,14 @@ def main() -> int:
     tracker_type = str(args.tracker_type).lower()
     trackers: List[dict] = []
     if auto_track and frame_step > 1:
-        print("[Track] --auto-track works best with --frame-step 1; forcing frame-step to 1")
-        frame_step = 1
+        print("[Track] Auto-track with frame-step > 1 enabled (faster, slightly less precise)")
     print(f"[Info] Frame step: {frame_step}")
     if auto_track:
-        print(f"[Info] Auto-track: enabled (tracker={tracker_type})")
+        print(
+            f"[Info] Auto-track: enabled (tracker={tracker_type}, "
+            f"max_shift_ratio={args.max_shift_ratio}, max_area_change={args.max_area_change}, "
+            f"pred_alpha={args.pred_alpha}, pred_beta={args.pred_beta}, vel_gamma={args.vel_gamma})"
+        )
     print("[Info] Controls: drag-box | click/select/move/resize | DEL delete-selected | 1..9 class | u undo | c clear-frame | n/SPACE next | q save+quit")
 
     while True:
@@ -521,7 +628,15 @@ def main() -> int:
             current_frame = frame
             current_boxes = []
             if auto_track and trackers:
-                current_boxes = predict_boxes_from_trackers(current_frame, trackers)
+                current_boxes = predict_boxes_from_trackers(
+                    current_frame,
+                    trackers,
+                    max_shift_ratio=float(args.max_shift_ratio),
+                    max_area_change=float(args.max_area_change),
+                    pred_alpha=float(args.pred_alpha),
+                    pred_beta=float(args.pred_beta),
+                    vel_gamma=float(args.vel_gamma),
+                )
                 if current_boxes:
                     print(f"[Track] frame={frame_idx + 1} predicted {len(current_boxes)} box(es)")
 
@@ -580,9 +695,20 @@ def main() -> int:
             if frame_step > 1:
                 skipped = 0
                 for _ in range(frame_step - 1):
-                    ok_skip, _ = cap.read()
+                    ok_skip, skip_frame = cap.read()
                     if not ok_skip:
                         break
+                    if auto_track and trackers and skip_frame is not None:
+                        # Advance tracker states across skipped frames.
+                        _ = predict_boxes_from_trackers(
+                            skip_frame,
+                            trackers,
+                            max_shift_ratio=float(args.max_shift_ratio),
+                            max_area_change=float(args.max_area_change),
+                            pred_alpha=float(args.pred_alpha),
+                            pred_beta=float(args.pred_beta),
+                            vel_gamma=float(args.vel_gamma),
+                        )
                     skipped += 1
                 if skipped < (frame_step - 1):
                     print("[Info] End of video reached during frame skip")
