@@ -1,0 +1,9 @@
+# HACKABOT assistive-navigation dependencies (Python 3.10+)
+ultralytics>=8.3.0
+opencv-python>=4.9.0
+numpy>=1.26.0
+PyYAML>=6.0.1
+simpleaudio>=1.0.4
+pyttsx3>=2.90
+python-dotenv>=1.0.1
+requests>=2.32.0
