@@ -72,3 +72,25 @@ python generate_elevenlabs_audio.py --mode all --overwrite
 - Audio events are logged to `assistive-navigation/logs/audio_events.csv`.
 - Missing audio files are reported but do not crash the pipeline.
 - Replace `PiCameraProviderStub` and `DistanceSensor` implementations for hardware without changing core demo logic.
+
+## Two-Pico Embedded MVP (Hackathon Path)
+
+Added standalone files in `assistive-navigation/`:
+- `pico_a_sensor_node.py` (MicroPython): HC-SR04 -> classify -> nRF24 TX
+- `pico_b_relay_node.py` (MicroPython): nRF24 RX -> USB serial relay
+- `laptop_relay_monitor.py` (Python): serial -> text/voice output
+
+### Run Order
+
+1. Flash `pico_a_sensor_node.py` to Pico A (`main.py`) and wire HC-SR04 (+ voltage divider on ECHO).
+2. Flash `pico_b_relay_node.py` to Pico B (`main.py`) and wire nRF24.
+3. On laptop:
+
+```bash
+cd assistive-navigation
+source ../.venv/bin/activate
+pip install -r requirements.txt
+python laptop_relay_monitor.py --port /dev/tty.usbmodemXXXX --voice
+```
+
+If you start with one sensor, set `USE_THREE_SENSORS = False` in `pico_a_sensor_node.py`.

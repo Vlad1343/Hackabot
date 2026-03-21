@@ -7,3 +7,4 @@ simpleaudio>=1.0.4
 pyttsx3>=2.90
 python-dotenv>=1.0.1
 requests>=2.32.0
+pyserial>=3.5

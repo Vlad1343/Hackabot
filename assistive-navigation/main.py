@@ -21,7 +21,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--filter-mode", choices=["median", "average"], default="median", help="Indoor only: filter method over last 3 reads")
     parser.add_argument("--use-hardware-radio", action="store_true", help="Indoor only: use nRF24 hardware transport placeholder")
     # Outdoor/computer-vision options (ignored by indoor loop)
-    parser.add_argument("--camera", type=int, default=0, help="Webcam index")
+    parser.add_argument("--stream", type=str, default="http://10.205.48.81:4747/video", help="DroidCam stream URL")
+    parser.add_argument("--stream-fallback", type=str, default="http://10.205.48.81:4747/mjpegfeed", help="DroidCam fallback stream URL")
     parser.add_argument("--video", type=str, default="", help="Pre-recorded video path (optional)")
     parser.add_argument("--show-overlay", action="store_true", help="Show bounding box overlay")
     parser.add_argument("--no-flip", action="store_true", help="Disable mirrored USER VIEW window")
@@ -44,4 +45,7 @@ async def run() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(run())
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        print("[Main] Stopped by user")

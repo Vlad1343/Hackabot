@@ -8,12 +8,14 @@ HARDWARE_CONFIG = {
         "sensor": "mock",      # mock | hc_sr04
         "radio": "mock",       # mock | nrf24
         "display": "console",  # console | ssd1306
-        "buzzer": "console",   # console | gpio
+        "buzzer": "none",      # none | console | gpio
     },
     "sensors": {
         "model": "HC-SR04",
         "count": 1,
         "max_range_cm": 400.0,
+        "raw_samples_per_tick": 3,
+        "ema_alpha": 0.4,
 
         # Reliability controls
         "echo_timeout_us": 30000,
@@ -83,5 +85,40 @@ HARDWARE_CONFIG = {
 
         # Structured debug
         "debug_enabled": False,
+        "drop_backlog": True,
+    },
+    "yolo": {
+        "enabled": True,
+        "backend": "udp",  # mock | udp
+        "camera_stream_url": "http://ESP32_CAM_IP:81/stream",
+        "udp_host": "0.0.0.0",
+        "udp_port": 5005,
+        "mock_rate_hz": 2.0,
+        "confidence_threshold": 0.3,
+        "temporal_smoothing_frames": 3,
+    },
+    "camera": {
+        # Processing must stay geometry-true (no flip before inference).
+        "flip_for_processing": False,
+        # UI preview can be mirrored for user comfort.
+        "flip_for_display": True,
+    },
+    "direction": {
+        # Global direction convention: LEFT < 0.33, FRONT 0.33..0.66, RIGHT > 0.66
+        "left_threshold": 0.33,
+        "right_threshold": 0.66,
+    },
+    "vision": {
+        "max_event_age_ms": 1500,
+        "smoothing_window": 3,
+        "direction_margin": 0.15,
+        "latest_frame_only": True,
+    },
+    "audio": {
+        "enabled": True,
+        "folder": "audio/indoors",
+        "multi_object_threshold": 2,
+        "cooldown_ms": 1000,
+        "confidence_threshold": 0.3,
     },
 }

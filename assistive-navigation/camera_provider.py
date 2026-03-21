@@ -6,6 +6,7 @@ stub for Pi camera. Frames captured asynchronously.
 from __future__ import annotations
 
 import asyncio
+import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Optional, Tuple
@@ -36,36 +37,81 @@ class CameraProvider(ABC):
         ...
 
 
-class WebcamCameraProvider(CameraProvider):
-    """Webcam for development on laptop."""
+class CameraSource:
+    """Network stream camera source (DroidCam MJPEG/HTTP)."""
 
-    def __init__(self, device_index: int = 0, width: int = 640, height: int = 480) -> None:
-        self.device_index = device_index
-        self.width = width
-        self.height = height
+    def __init__(self, source: str) -> None:
+        self.source = source
         self.cap: Optional[cv2.VideoCapture] = None
+        self._last_reconnect_attempt = 0.0
+        self._last_frame_log = 0.0
+
+    def is_open(self) -> bool:
+        return self.cap is not None and self.cap.isOpened()
+
+    def reconnect(self) -> None:
+        now = time.monotonic()
+        if now - self._last_reconnect_attempt < 2.0:
+            return
+        self._last_reconnect_attempt = now
+        print("[CAMERA] reconnecting...")
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+        self.cap = cv2.VideoCapture(self.source)
+        if self.cap.isOpened():
+            print("[CAMERA] connected to DroidCam stream")
+
+    def read(self) -> Optional[np.ndarray]:
+        if not self.is_open():
+            self.reconnect()
+            return None
+        ok, frame = self.cap.read()
+        if not ok or frame is None:
+            print("[CAMERA] frame dropped")
+            self.reconnect()
+            return None
+        now = time.monotonic()
+        if now - self._last_frame_log >= 2.0:
+            self._last_frame_log = now
+            print("[CAMERA] frame received")
+        return frame
+
+    def close(self) -> None:
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+
+
+class NetworkCameraProvider(CameraProvider):
+    """DroidCam network stream provider with auto-reconnect."""
+
+    def __init__(self, source: str, fallback_source: Optional[str] = None) -> None:
+        self.source = source
+        self.fallback_source = fallback_source
+        self.camera = CameraSource(source=source)
 
     async def start(self) -> None:
         if cv2 is None:
             raise CameraError("opencv-python is not installed")
-        self.cap = cv2.VideoCapture(self.device_index)
-        if not self.cap.isOpened():
-            raise CameraError(f"Unable to open webcam index {self.device_index}")
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        self.camera.reconnect()
+        if not self.camera.is_open():
+            if self.fallback_source:
+                print(f"[CAMERA] primary stream unavailable, trying fallback: {self.fallback_source}")
+                self.camera = CameraSource(source=self.fallback_source)
+                self.camera.reconnect()
+            if not self.camera.is_open():
+                print(
+                    "[CAMERA] stream unavailable at startup; continuing in retry mode: "
+                    f"{self.source}"
+                    + (f" / {self.fallback_source}" if self.fallback_source else "")
+                )
 
     async def read(self) -> Optional[np.ndarray]:
-        if self.cap is None:
-            return None
-        ok, frame = await asyncio.to_thread(self.cap.read)
-        if not ok:
-            return None
-        return frame
+        return await asyncio.to_thread(self.camera.read)
 
     async def stop(self) -> None:
-        if self.cap is not None:
-            self.cap.release()
-            self.cap = None
+        self.camera.close()
 
 
 class VideoFileCameraProvider(CameraProvider):

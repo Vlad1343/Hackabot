@@ -20,6 +20,20 @@ from typing import Dict, List, Tuple
 
 import cv2
 
+CLASS_COLORS = {
+    "traffic_light_red": (0, 0, 255),
+    "traffic_light_yellow": (0, 255, 255),
+    "traffic_light_green": (0, 200, 0),
+    "car": (255, 120, 0),
+    "pedestrian": (255, 0, 255),
+    "bicycle": (255, 255, 0),
+    "bus": (0, 165, 255),
+}
+
+
+def class_color(label: str) -> tuple[int, int, int]:
+    return CLASS_COLORS.get(str(label).strip().lower(), (0, 255, 0))
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Overlay simulated YOLO detections on video")
@@ -223,15 +237,16 @@ def main() -> int:
             cx = (x1 + x2) // 2
             direction = direction_label(cx, width)
             label = cls if not args.show_direction else f"{cls} {direction}"
+            color = class_color(cls)
 
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             cv2.putText(
                 frame,
                 label,
                 (x1, max(15, y1 - 8)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
-                (0, 255, 0),
+                color,
                 2,
                 cv2.LINE_AA,
             )

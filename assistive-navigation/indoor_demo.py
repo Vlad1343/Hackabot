@@ -24,6 +24,36 @@ SAFE = "SAFE"
 WARNING = "WARNING"
 DANGER = "DANGER"
 VALID_STATES = {SAFE, WARNING, DANGER}
+VALID_LABELS = {"PERSON", "CHAIR", "TABLE", "MULTIPLE_OBJECTS", "SEVERAL_PERSON"}
+LABEL_PRIORITY = {"PERSON": 1, "SEVERAL_PERSON": 1, "CHAIR": 2, "TABLE": 3, "MULTIPLE_OBJECTS": 4}
+AUDIO_IDLE = "IDLE"
+AUDIO_PLAYING = "PLAYING"
+AUDIO_STOPPING = "STOPPING"
+LABEL_MAP = {
+    "person": "PERSON",
+    "pedestrian": "PERSON",
+    "chair": "CHAIR",
+    "dining table": "TABLE",
+    "diningtable": "TABLE",
+    "table": "TABLE",
+}
+AUDIO_MAP = {
+    ("PERSON", "LEFT"): "person_left.wav",
+    ("PERSON", "RIGHT"): "person_right.wav",
+    ("PERSON", "FRONT"): "person_ahead.wav",
+    ("CHAIR", "LEFT"): "chair_left.wav",
+    ("CHAIR", "RIGHT"): "chair_right.wav",
+    ("CHAIR", "FRONT"): "chair_ahead.wav",
+    ("TABLE", "LEFT"): "table_left.wav",
+    ("TABLE", "RIGHT"): "table_right.wav",
+    ("TABLE", "FRONT"): "table_ahead.wav",
+    ("SEVERAL_PERSON", "ANY"): "several_person_ahead.wav",
+    ("MULTIPLE_OBJECTS", "ANY"): "multiple_objects.wav",
+}
+
+
+def now_ms() -> int:
+    return int(time.monotonic() * 1000)
 
 
 def get_hardware_config() -> Dict[str, Any]:
@@ -176,6 +206,20 @@ class IndoorPacket:
         else:
             payload["distance"] = self.distance
         return payload
+
+
+@dataclass
+class SystemState:
+    current_object: Optional[str] = None
+    current_direction: str = "FRONT"
+    priority: int = 99
+    last_frame_id: int = -1
+    last_update_time: int = 0
+    audio_state: str = AUDIO_IDLE
+    ultrasonic_state: str = SAFE
+    last_speak_time: int = 0
+    next_speak_time: int = 0
+    active_until_time: int = 0
 
 
 class DistanceFilter:
@@ -659,14 +703,22 @@ class UDPYoloEventProvider(SemanticEventProvider):
         self.smoother = TemporalEventSmoother(smoothing_frames, confidence_threshold)
 
     def _normalize_obj(self, obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        cls = str(obj.get("label", obj.get("class", "UNKNOWN"))).upper()
+        raw_label = str(obj.get("label", obj.get("class", ""))).strip().lower()
         conf = float(obj.get("confidence", 0.0))
+        print(f"[YOLO RAW] {raw_label} {conf:.2f}")
+        mapped = LABEL_MAP.get(raw_label)
+        if mapped is None:
+            return None
+        cls = mapped
+        print(f"[YOLO FILTERED] {cls}")
 
         x_norm = obj.get("x_center_norm")
         y_norm = obj.get("y_center_norm")
         zone = str(obj.get("zone", "")).upper()
         frame_id = int(obj.get("frame_id", 0))
         timestamp_ms = int(obj.get("timestamp_ms", int(time.time() * 1000)))
+        bbox_area = float(obj.get("bbox_area", 0.0) or 0.0)
+        object_count = int(obj.get("object_count", 1))
 
         if x_norm is None:
             pos = str(obj.get("position", "front")).lower()
@@ -690,7 +742,7 @@ class UDPYoloEventProvider(SemanticEventProvider):
         x_norm = max(0.0, min(1.0, x_norm))
         y_norm = max(0.0, min(1.0, y_norm))
 
-        computed_zone = zone_from_centroid_score(x_norm, conf, self.direction_margin)
+        computed_zone = zone_from_x_norm(x_norm, self.left_threshold, self.right_threshold)
         if zone not in {"LEFT", "FRONT", "RIGHT"}:
             zone = computed_zone
         else:
@@ -705,6 +757,8 @@ class UDPYoloEventProvider(SemanticEventProvider):
             "confidence": round(conf, 3),
             "timestamp_ms": timestamp_ms,
             "frame_id": frame_id,
+            "bbox_area": bbox_area,
+            "object_count": object_count,
         }
 
     def _bbox_area(self, obj: Dict[str, Any]) -> float:
@@ -729,6 +783,7 @@ class UDPYoloEventProvider(SemanticEventProvider):
             ),
         )
         primary = dict(ranked[0])
+        primary["object_count"] = len(objs)
         if len(objs) >= self.multi_object_threshold:
             primary["label"] = "MULTIPLE_OBJECTS"
         return primary
@@ -750,21 +805,29 @@ class UDPYoloEventProvider(SemanticEventProvider):
         return self._stable_zone
 
     async def get_events(self) -> List[Dict[str, Any]]:
-        latest_data: Optional[bytes] = None
+        candidates: List[Dict[str, Any]] = []
         try:
             while True:
                 data, _ = self.sock.recvfrom(4096)
-                latest_data = data
+                try:
+                    payload = json.loads(data.decode("utf-8"))
+                    if isinstance(payload, dict):
+                        candidates.append(payload)
+                except Exception:
+                    continue
                 if not self.latest_frame_only:
                     break
         except BlockingIOError:
-            if latest_data is None:
+            if not candidates:
                 return self.latest
         except Exception:
             return self.latest
 
         try:
-            payload = json.loads((latest_data or b"{}").decode("utf-8"))
+            payload = max(
+                candidates,
+                key=lambda p: (int(p.get("timestamp_ms", 0)), int(p.get("frame_id", 0))),
+            )
             frame_id = int(payload.get("frame_id", 0))
             if self.latest_frame_only and frame_id <= self._last_frame_id:
                 return self.latest
@@ -803,27 +866,21 @@ class IndoorAudioAnnouncer:
         self.repeat_ms = max(1000, int(cooldown_ms))
         self.active_timeout_ms = 1500
         self.confidence_threshold = float(confidence_threshold)
-        self.current_object: Optional[str] = None
-        self.last_spoken_time = 0
-        self.last_frame_id = -1
-        self.active_object_timer = 0
+        self.state = SystemState()
         self._proc: Optional[asyncio.subprocess.Process] = None
-        self._file_map = {
-            "PERSON": "person.mp3",
-            "CHAIR": "chair.mp3",
-            "TABLE": "table.mp3",
-            "CAR": "car.mp3",
-            "MULTIPLE_OBJECTS": "multiple_objects.mp3",
-        }
-        self._priority = {
-            "PERSON": 4,
-            "CHAIR": 3,
-            "TABLE": 2,
-            "MULTIPLE_OBJECTS": 1,
-        }
+        self._stop_requested_at = 0
+        self._pending_label: Optional[str] = None
 
-    def _resolve_audio_path(self, key: str) -> Optional[str]:
-        fn = self._file_map.get(key)
+    def _resolve_audio_path(self, label: str, direction: str) -> Optional[str]:
+        direction = direction if direction in {"LEFT", "RIGHT", "FRONT"} else "FRONT"
+        fn = AUDIO_MAP.get((label, direction))
+        if fn is None and label in {"MULTIPLE_OBJECTS", "SEVERAL_PERSON"}:
+            if label == "SEVERAL_PERSON":
+                fn = AUDIO_MAP.get(("SEVERAL_PERSON", "ANY"))
+            if fn is None:
+                fn = AUDIO_MAP.get(("MULTIPLE_OBJECTS", "ANY"))
+        if fn is None and label == "MULTIPLE_OBJECTS":
+            fn = AUDIO_MAP.get(("MULTIPLE_OBJECTS", "ANY"))
         if not fn:
             return None
         path = os.path.join(self.folder, fn)
@@ -833,26 +890,33 @@ class IndoorAudioAnnouncer:
         return
 
     async def stop(self) -> None:
-        await self.interrupt()
+        await self.clear()
 
-    async def interrupt(self) -> None:
+    async def _request_stop(self) -> None:
+        if self.state.audio_state == AUDIO_STOPPING:
+            return
+        self.state.audio_state = AUDIO_STOPPING
+        self._stop_requested_at = now_ms()
         if self._proc and self._proc.returncode is None:
             self._proc.terminate()
-            try:
-                await asyncio.wait_for(self._proc.wait(), timeout=0.2)
-            except Exception:
-                self._proc.kill()
-                with contextlib.suppress(Exception):
-                    await self._proc.wait()
-        self._proc = None
+        else:
+            self.state.audio_state = AUDIO_IDLE
+
+    async def clear(self) -> None:
+        await self._request_stop()
+        self.state.current_object = None
+        self.state.current_direction = "FRONT"
+        self.state.priority = 99
+        self.state.active_until_time = 0
+        self.state.next_speak_time = 0
+        self.state.last_speak_time = 0
 
     async def _speak(self, key: str) -> None:
-        path = self._resolve_audio_path(key)
+        path = self._resolve_audio_path(key, self.state.current_direction)
         if path is None:
-            print(f"[Audio] Missing file for {key} in {self.folder}")
+            print(f"[Audio] Missing file for {key}:{self.state.current_direction} in {self.folder}")
             return
 
-        await self.interrupt()
         player = None
         if shutil.which("afplay"):
             player = ["afplay", path]
@@ -862,71 +926,130 @@ class IndoorAudioAnnouncer:
             player = ["mpg123", "-q", path]
         try:
             if player is None:
-                print(f"[Audio] No player found; simulated: {key}")
-                await asyncio.sleep(0.15)
+                print(f"[Audio] No player found; simulated: {key}:{self.state.current_direction}")
+                self._proc = None
+                self.state.audio_state = AUDIO_IDLE
             else:
                 self._proc = await asyncio.create_subprocess_exec(
                     *player,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
+                self.state.audio_state = AUDIO_PLAYING
         except Exception as exc:
             print(f"[Audio] playback error: {exc}")
             self._proc = None
+            self.state.audio_state = AUDIO_IDLE
 
-    def _is_higher_priority(self, new_key: str, old_key: Optional[str]) -> bool:
-        if old_key is None:
-            return True
-        return self._priority.get(new_key, 0) >= self._priority.get(old_key, 0)
+    async def tick(self) -> None:
+        ts = now_ms()
+        if self.state.audio_state == AUDIO_STOPPING:
+            if self._proc and self._proc.returncode is None:
+                if (ts - self._stop_requested_at) > 250:
+                    self._proc.kill()
+                    with contextlib.suppress(Exception):
+                        await self._proc.wait()
+                    self._proc = None
+                    self.state.audio_state = AUDIO_IDLE
+            else:
+                self._proc = None
+                self.state.audio_state = AUDIO_IDLE
+
+        if self.state.audio_state == AUDIO_PLAYING and self._proc and self._proc.returncode is not None:
+            self._proc = None
+            self.state.audio_state = AUDIO_IDLE
+
+        if self.state.audio_state == AUDIO_IDLE and self._pending_label:
+            label = self._pending_label
+            self._pending_label = None
+            await self._speak(label)
 
     async def process(
         self,
         *,
-        detected_key: Optional[str],
+        detected_event: Optional[Dict[str, Any]],
         frame_id: int,
-        confidence: float,
         suppress: bool,
     ) -> None:
         if not self.enabled:
             return
-        now_ms = int(time.time() * 1000)
+        ts = now_ms()
+        self.state.ultrasonic_state = DANGER if suppress else SAFE
 
         if suppress:
-            await self.interrupt()
-            self.current_object = None
-            self.active_object_timer = 0
+            await self.clear()
+            await self.tick()
             return
 
-        # Reset active state when object vanished.
-        if self.current_object and (now_ms - self.active_object_timer) > self.active_timeout_ms:
-            self.current_object = None
+        # Expire active object when not refreshed.
+        if self.state.current_object and ts > self.state.active_until_time:
+            await self.clear()
 
-        key = detected_key.upper() if detected_key else None
-        has_valid_detection = bool(key) and float(confidence) >= self.confidence_threshold
-        has_new_frame = frame_id > self.last_frame_id
+        key: Optional[str] = None
+        conf = 0.0
+        direction = "FRONT"
+        if detected_event:
+            key = str(detected_event.get("label", "")).upper()
+            conf = float(detected_event.get("confidence", 0.0))
+            frame_id = int(detected_event.get("frame_id", frame_id))
+            direction = str(detected_event.get("zone", "FRONT")).upper()
+
+        has_valid_detection = bool(key) and key in VALID_LABELS and conf >= self.confidence_threshold
+        has_new_frame = frame_id > self.state.last_frame_id
 
         if has_valid_detection and has_new_frame:
-            self.last_frame_id = frame_id
-            self.active_object_timer = now_ms
-            if key != self.current_object:
-                # New event interrupts immediately (single active channel rule).
-                if key:
-                    self.current_object = key
-                    await self._speak(key)
-                    self.last_spoken_time = now_ms
-                    return
-            else:
-                # Same object, repeat every 1 second while persistent.
-                if (now_ms - self.last_spoken_time) >= self.repeat_ms:
-                    await self._speak(key)
-                    self.last_spoken_time = now_ms
-                    return
+            self.state.last_frame_id = frame_id
+            new_priority = LABEL_PRIORITY.get(key or "", 99)
+            self.state.last_update_time = ts
+            self.state.active_until_time = ts + self.active_timeout_ms
 
-        # Continue repeating for persistent object while detections keep it active.
-        if self.current_object and (now_ms - self.active_object_timer) <= self.active_timeout_ms:
-            if (now_ms - self.last_spoken_time) >= self.repeat_ms:
-                await self._speak(self.current_object)
-                self.last_spoken_time = now_ms
+            # New active label selection with strict priority handling.
+            if self.state.current_object is None:
+                self.state.current_object = key
+                self.state.current_direction = direction
+                self.state.priority = new_priority
+                self.state.last_speak_time = ts
+                self.state.next_speak_time = ts + self.repeat_ms
+                self._pending_label = key
+                await self.tick()
+                return
+
+            if new_priority < self.state.priority:
+                self.state.current_object = key
+                self.state.current_direction = direction
+                self.state.priority = new_priority
+                self.state.last_speak_time = ts
+                self.state.next_speak_time = ts + self.repeat_ms
+                await self._request_stop()
+                self._pending_label = key
+                await self.tick()
+                return
+
+            if new_priority == self.state.priority:
+                if key != self.state.current_object:
+                    self.state.current_object = key
+                    self.state.current_direction = direction
+                    self.state.priority = new_priority
+                    self.state.last_speak_time = ts
+                    self.state.next_speak_time = ts + self.repeat_ms
+                    await self._request_stop()
+                    self._pending_label = key
+                    await self.tick()
+                return
+
+            # Lower priority events are ignored while higher is active.
+            return
+
+        # Hard 1Hz repetition on monotonic clock while object remains active.
+        if self.state.current_object and ts <= self.state.active_until_time:
+            if self.state.next_speak_time and ts >= self.state.next_speak_time:
+                self.state.last_speak_time = self.state.next_speak_time
+                self.state.next_speak_time = self.state.last_speak_time + self.repeat_ms
+                await self._request_stop()
+                self._pending_label = self.state.current_object
+                await self.tick()
+                return
+        await self.tick()
 
 
 class _SSD1306Adapter:
@@ -1003,6 +1126,9 @@ class BuzzerController:
         self._init_backend()
 
     def _init_backend(self) -> None:
+        if self.backend in {"none", "off", "disabled"}:
+            self.backend = "none"
+            return
         if self.backend == "console":
             return
         if self.backend != "gpio":
@@ -1035,7 +1161,7 @@ class BuzzerController:
             self._pin_obj = None
 
     def _write(self, on: bool) -> None:
-        if self.backend == "console":
+        if self.backend in {"console", "none"}:
             return
         level = 1 if (on == self._active_high) else 0
         if hasattr(self._pin_obj, "value"):
@@ -1063,6 +1189,9 @@ class BuzzerController:
 
     async def _loop(self) -> None:
         while self._running:
+            if self.backend == "none":
+                await asyncio.sleep(0.1)
+                continue
             if self.state == SAFE:
                 self._write(False)
                 await asyncio.sleep(0.05)
@@ -1114,28 +1243,114 @@ def _debug(enabled: bool, event: str, **fields: Any) -> None:
     print(f"[DEBUG] {json.dumps(payload, separators=(',', ':'))}")
 
 
-def select_audio_event(
+def normalize_vision_events(
+    events: List[Dict[str, Any]],
+    confidence_threshold: float,
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for e in events:
+        try:
+            raw_label = str(e.get("label", "")).strip().lower()
+            if raw_label == "multiple_objects":
+                label = "MULTIPLE_OBJECTS"
+            elif raw_label == "several_person":
+                label = "SEVERAL_PERSON"
+            else:
+                mapped = LABEL_MAP.get(raw_label)
+                if mapped is None:
+                    continue
+                label = mapped
+            conf = float(e.get("confidence", 0.0))
+            if label not in VALID_LABELS:
+                continue
+            if conf < confidence_threshold:
+                continue
+            out.append(
+                {
+                    "frame_id": int(e.get("frame_id", -1)),
+                    "timestamp_ms": int(e.get("timestamp_ms", now_ms())),
+                    "label": label,
+                    "confidence": conf,
+                    "x_center_norm": float(e.get("x_center_norm", 0.5)),
+                    "bbox_area": float(e.get("bbox_area", 0.0)),
+                    "object_count": int(e.get("object_count", 1)),
+                }
+            )
+        except Exception:
+            continue
+    return out
+
+
+def resolve_primary_event(
     events: List[Dict[str, Any]],
     multi_object_threshold: int,
-    confidence_threshold: float,
-) -> tuple[Optional[str], int, float]:
-    valid = [e for e in events if float(e.get("confidence", 0.0)) >= confidence_threshold]
-    if not valid:
-        return None, -1, 0.0
-    frame_id = max(int(e.get("frame_id", -1)) for e in valid)
-    if len(valid) >= max(2, multi_object_threshold):
-        conf = max(float(e.get("confidence", 0.0)) for e in valid)
-        return "MULTIPLE_OBJECTS", frame_id, conf
+) -> Optional[Dict[str, Any]]:
+    if not events:
+        return None
+    object_count = max(len(events), max(int(e.get("object_count", 1)) for e in events))
+    frame_id = max(int(e["frame_id"]) for e in events)
+    ts = max(int(e["timestamp_ms"]) for e in events)
+    if object_count >= max(2, multi_object_threshold):
+        labels = [str(e.get("label", "")).upper() for e in events]
+        if labels and all(lbl == "PERSON" for lbl in labels):
+            return {
+                "frame_id": frame_id,
+                "timestamp_ms": ts,
+                "label": "SEVERAL_PERSON",
+                "confidence": max(float(e["confidence"]) for e in events),
+                "x_center_norm": 0.5,
+                "zone": "FRONT",
+                "object_count": object_count,
+            }
+        return {
+            "frame_id": frame_id,
+            "timestamp_ms": ts,
+            "label": "MULTIPLE_OBJECTS",
+            "confidence": max(float(e["confidence"]) for e in events),
+            "x_center_norm": float(sum(float(e["x_center_norm"]) for e in events) / object_count),
+            "zone": "FRONT",
+            "object_count": object_count,
+        }
 
-    priority = {"PERSON": 4, "CHAIR": 3, "TABLE": 2, "MULTIPLE_OBJECTS": 1}
     best = sorted(
-        valid,
+        events,
         key=lambda e: (
-            -priority.get(str(e.get("label", "")).upper(), 0),
-            -float(e.get("confidence", 0.0)),
+            -float(e["confidence"]),
+            -float(e.get("bbox_area", 0.0)),
+            abs(float(e["x_center_norm"]) - 0.5),
         ),
     )[0]
-    return str(best.get("label", "")).upper(), int(best.get("frame_id", frame_id)), float(best.get("confidence", 0.0))
+    return {
+        "frame_id": int(best["frame_id"]),
+        "timestamp_ms": int(best["timestamp_ms"]),
+        "label": str(best["label"]),
+        "confidence": float(best["confidence"]),
+        "x_center_norm": float(best["x_center_norm"]),
+        "zone": zone_from_x_norm(float(best["x_center_norm"]), 0.33, 0.66),
+        "object_count": 1,
+    }
+
+
+class LabelStabilityGate:
+    def __init__(self, min_consecutive_ticks: int = 2) -> None:
+        self.min_consecutive_ticks = max(1, min_consecutive_ticks)
+        self._last_label: Optional[str] = None
+        self._count = 0
+
+    def filter(self, event: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not event:
+            self._last_label = None
+            self._count = 0
+            return None
+        label = str(event.get("label", "")).upper()
+        if label == self._last_label:
+            self._count += 1
+        else:
+            self._last_label = label
+            self._count = 1
+        if self._count >= self.min_consecutive_ticks:
+            return event
+        return None
 
 
 async def sensor_node_loop(
@@ -1240,8 +1455,8 @@ async def receiver_node_loop(
     await buzzer.start()
     await announcer.start()
 
-    radio_tick = PeriodicScheduler(radio_hz)
-    ui_tick = PeriodicScheduler(ui_hz)
+    tick_ms = 50
+    stability_gate = LabelStabilityGate(min_consecutive_ticks=2)
 
     last_packet_at = time.monotonic()
     latest_packet: Optional[Dict[str, object]] = None
@@ -1249,103 +1464,97 @@ async def receiver_node_loop(
     latest_events: List[Dict[str, Any]] = []
 
     try:
+        next_tick = time.monotonic()
         while True:
-            now = time.monotonic()
-            if radio_tick.due(now):
-                packet = None
+            tick_start = time.monotonic()
+
+            # 1) sensor_input: drain packet backlog, keep only latest.
+            packet = None
+            try:
+                while True:
+                    p = await rx.recv()
+                    if p is None:
+                        break
+                    packet = p
+            except Exception:
+                packet = packet
+
+            if packet is not None and _validate_packet(packet):
+                latest_packet = packet
+                latest_state = str(packet["state"])
+                last_packet_at = tick_start
+                buzzer.set_state(latest_state)
+                if latest_state == DANGER:
+                    await announcer.clear()
+                _debug(debug_enabled, "radio_rx_tick", status="ok", state=latest_state)
+            elif packet is not None:
+                _debug(debug_enabled, "radio_rx_tick", status="invalid_packet")
+
+            # 2) vision_input, latest only from provider.
+            if semantic_provider is not None:
                 try:
-                    packet = await rx.recv()
+                    latest_events = await semantic_provider.get_events()
                 except Exception:
-                    packet = None
+                    latest_events = []
 
-                if packet is not None and _validate_packet(packet):
-                    latest_packet = packet
-                    latest_state = str(packet["state"])
-                    last_packet_at = now
-                    buzzer.set_state(latest_state)
+            now_ms_wall = int(time.time() * 1000)
+            latest_events = [
+                e
+                for e in latest_events
+                if isinstance(e, dict) and (now_ms_wall - int(e.get("timestamp_ms", now_ms_wall))) <= max_event_age_ms
+            ]
+
+            # 3) normalize + resolve + flicker gate
+            normalized_events = normalize_vision_events(latest_events, confidence_threshold=audio_confidence_threshold)
+            primary_event = resolve_primary_event(normalized_events, multi_object_threshold=multi_object_threshold)
+            stable_event = stability_gate.filter(primary_event)
+            if stable_event and str(stable_event.get("label", "")).upper() not in VALID_LABELS:
+                stable_event = None
+
+            # 4) fusion + decision + audio output
+            if tick_start - last_packet_at >= no_signal_timeout_sec:
+                await announcer.process(detected_event=None, frame_id=-1, suppress=False)
+                await ui.render("NO SIGNAL")
+                buzzer.set_state(SAFE)
+                _debug(debug_enabled, "ui_tick", view="NO SIGNAL")
+            else:
+                if latest_packet is None:
+                    await ui.render("SAFE")
+                else:
+                    us_dir = nearest_direction(latest_packet.get("distances", {})) if "distances" in latest_packet else "FRONT"
                     if latest_state == DANGER:
-                        await announcer.interrupt()
-                        announcer.set_visible_key(None)
-                    _debug(debug_enabled, "radio_rx_tick", status="ok", state=latest_state)
-                elif packet is not None:
-                    _debug(debug_enabled, "radio_rx_tick", status="invalid_packet")
-                else:
-                    _debug(debug_enabled, "radio_rx_tick", status="no_packet")
-
-                radio_tick.advance(now)
-
-            now = time.monotonic()
-            if ui_tick.due(now):
-                if semantic_provider is not None:
-                    try:
-                        latest_events = await semantic_provider.get_events()
-                    except Exception:
-                        latest_events = []
-                now_ms = int(time.time() * 1000)
-                latest_events = [
-                    e
-                    for e in latest_events
-                    if isinstance(e, dict) and (now_ms - int(e.get("timestamp_ms", now_ms))) <= max_event_age_ms
-                ]
-
-                if now - last_packet_at >= no_signal_timeout_sec:
-                    await announcer.process(detected_key=None, frame_id=-1, confidence=0.0, suppress=False)
-                    await ui.render("NO SIGNAL")
-                    buzzer.set_state(SAFE)
-                    _debug(debug_enabled, "ui_tick", view="NO SIGNAL")
-                else:
-                    if latest_packet is None:
-                        await ui.render("SAFE")
+                        await announcer.process(detected_event=None, frame_id=-1, suppress=True)
+                        text = f"DANGER {us_dir}"
+                    elif latest_state == WARNING:
+                        text = f"WARNING {us_dir}"
+                        if stable_event:
+                            text = f"WARNING {str(stable_event.get('label', 'OBJECT')).upper()} {us_dir}"
                     else:
-                        # Ultrasonic direction always authoritative.
-                        us_dir = nearest_direction(latest_packet.get("distances", {})) if "distances" in latest_packet else "FRONT"
+                        text = "SAFE"
 
-                        if latest_state == DANGER:
-                            await announcer.interrupt()
-                            await announcer.process(detected_key=None, frame_id=-1, confidence=0.0, suppress=True)
-                            text = f"DANGER {us_dir}"
-                        elif latest_state == WARNING:
-                            text = f"WARNING {us_dir}"
-                            if latest_events:
-                                # YOLO only adds semantic label.
-                                top = max(latest_events, key=lambda x: float(x.get("confidence", 0.0)))
-                                text = f"WARNING {str(top.get('label', 'OBJECT')).upper()} {us_dir}"
-                        else:
-                            text = "SAFE"
+                    sub = f"{latest_packet['distance']} cm" if "distance" in latest_packet else str(latest_packet.get("distances", {}))
+                    await ui.render(text, sub)
+                    await announcer.process(
+                        detected_event=stable_event if latest_state != DANGER else None,
+                        frame_id=int(stable_event.get("frame_id", -1)) if stable_event else -1,
+                        suppress=(latest_state == DANGER),
+                    )
+                    _debug(
+                        debug_enabled,
+                        "fusion_decision",
+                        frame_id=int(stable_event.get("frame_id", -1)) if stable_event else -1,
+                        timestamp_ms=now_ms_wall,
+                        state=latest_state,
+                        view=text,
+                        reason="ultrasonic_override" if latest_state in {WARNING, DANGER} else "vision_or_clear",
+                        yolo_event=stable_event,
+                        audio_key=(str(stable_event.get("label", "")) if stable_event else None),
+                    )
 
-                        if "distance" in latest_packet:
-                            sub = f"{latest_packet['distance']} cm"
-                        else:
-                            sub = str(latest_packet.get("distances", {}))
-                        await ui.render(text, sub)
-                        announce_key, announce_frame_id, announce_conf = select_audio_event(
-                            latest_events,
-                            multi_object_threshold=multi_object_threshold,
-                            confidence_threshold=audio_confidence_threshold,
-                        )
-                        await announcer.process(
-                            detected_key=announce_key if latest_state != DANGER else None,
-                            frame_id=announce_frame_id,
-                            confidence=announce_conf,
-                            suppress=(latest_state == DANGER),
-                        )
-
-                        top_frame = int(latest_events[0].get("frame_id", -1)) if latest_events else -1
-                        _debug(
-                            debug_enabled,
-                            "fusion_decision",
-                            frame_id=top_frame,
-                            timestamp_ms=int(time.time() * 1000),
-                            state=latest_state,
-                            view=text,
-                            reason="ultrasonic_override" if latest_state in {WARNING, DANGER} else "vision_or_clear",
-                            yolo_events=latest_events,
-                            audio_key=announce_key,
-                        )
-                ui_tick.advance(now)
-
-            sleep_for = _sleep_to_next(time.monotonic(), [radio_tick, ui_tick])
-            await asyncio.sleep(sleep_for)
+            next_tick += tick_ms / 1000.0
+            if next_tick < time.monotonic() - (tick_ms / 1000.0):
+                next_tick = time.monotonic()
+            await asyncio.sleep(max(0.0, next_tick - time.monotonic()))
     finally:
         await announcer.stop()
         await buzzer.stop()
@@ -1435,30 +1644,47 @@ async def run(args: argparse.Namespace) -> None:
         if processing_flip:
             print("[Vision] FRAME MIRRORING VIOLATION: inference pipeline configured as mirrored")
 
-        if yolo_backend == "mock":
-            semantic_provider = MockSemanticEventProvider(
-                rate_hz=float(yolo_cfg.get("mock_rate_hz", 2.0)),
-                confidence_threshold=confidence_threshold,
-                smoothing_frames=smoothing_frames,
-            )
-        elif yolo_backend == "udp":
-            semantic_provider = UDPYoloEventProvider(
-                host=str(yolo_cfg.get("udp_host", "0.0.0.0")),
-                port=int(yolo_cfg.get("udp_port", 5005)),
-                confidence_threshold=confidence_threshold,
-                smoothing_frames=smoothing_frames,
-                left_threshold=left_threshold,
-                right_threshold=right_threshold,
-                direction_margin=direction_margin,
-                processing_flip=processing_flip,
-                multi_object_threshold=multi_object_threshold,
-                latest_frame_only=latest_frame_only,
-            )
-        else:
-            print(f"[YOLO] Unknown backend '{yolo_backend}', disabled")
+        try:
+            if yolo_backend == "mock":
+                semantic_provider = MockSemanticEventProvider(
+                    rate_hz=float(yolo_cfg.get("mock_rate_hz", 2.0)),
+                    confidence_threshold=confidence_threshold,
+                    smoothing_frames=smoothing_frames,
+                )
+            elif yolo_backend == "udp":
+                semantic_provider = UDPYoloEventProvider(
+                    host=str(yolo_cfg.get("udp_host", "0.0.0.0")),
+                    port=int(yolo_cfg.get("udp_port", 5005)),
+                    confidence_threshold=confidence_threshold,
+                    smoothing_frames=smoothing_frames,
+                    left_threshold=left_threshold,
+                    right_threshold=right_threshold,
+                    direction_margin=direction_margin,
+                    processing_flip=processing_flip,
+                    multi_object_threshold=multi_object_threshold,
+                    latest_frame_only=latest_frame_only,
+                )
+            else:
+                print(f"[YOLO] Unknown backend '{yolo_backend}', disabled")
+        except Exception as exc:
+            semantic_provider = None
+            print(f"[YOLO] provider init failed, disabling vision stream: {exc}")
+    else:
+        print("[YOLO] Disabled in hardware_config.py")
 
     display_backend = str(backend_cfg.get("display", "console")).lower()
     buzzer_backend = str(backend_cfg.get("buzzer", "console")).lower()
+    print(
+        "[Indoor] startup "
+        f"sensor_backend={sensor_backend} radio_backend={radio_backend} "
+        f"yolo_enabled={bool(yolo_cfg.get('enabled', False))} yolo_backend={str(yolo_cfg.get('backend', 'mock')).lower()} "
+        f"audio_enabled={audio_enabled} buzzer_backend={buzzer_backend}"
+    )
+    if bool(yolo_cfg.get("enabled", False)) and str(yolo_cfg.get("backend", "mock")).lower() == "udp":
+        print(
+            "[YOLO] waiting for UDP objects on "
+            f"{str(yolo_cfg.get('udp_host', '0.0.0.0'))}:{int(yolo_cfg.get('udp_port', 5005))}"
+        )
 
     tasks: List[asyncio.Task] = []
     try:

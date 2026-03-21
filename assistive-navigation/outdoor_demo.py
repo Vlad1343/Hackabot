@@ -2,7 +2,7 @@
 HACKABOT Outdoor Demo.
 Detects cars, bicycles, pedestrians, traffic lights; simulates navigation.
 Uses pre-recorded audio; prioritizes warnings; cooldowns per object/direction.
-Run: python outdoor_demo.py [--camera 0] [--show-overlay] [--keyboard-sensor] [--simulate-obstacles] [--simulate-navigation]
+Run: python outdoor_demo.py [--stream URL] [--show-overlay] [--keyboard-sensor] [--simulate-obstacles] [--simulate-navigation]
 """
 from __future__ import annotations
 
@@ -16,12 +16,15 @@ import cv2
 
 from announcement_gate import StableAnnouncementGate
 from audio_controller import AudioController
-from camera_provider import VideoFileCameraProvider, WebcamCameraProvider, draw_debug_overlay
+from camera_provider import NetworkCameraProvider, VideoFileCameraProvider, draw_debug_overlay
 from config import load_config
 from detection import DetectionEngine
 from distance_sensor import KeyboardDistanceSensor
 from navigation_simulator import NavigationSimulator
 from obstacle_simulator import ObstacleSimulator
+
+DROIDCAM_PRIMARY = "http://10.205.48.81:4747/video"
+DROIDCAM_FALLBACK = "http://10.205.48.81:4747/mjpegfeed"
 
 
 def event_to_audio_key(
@@ -58,7 +61,11 @@ async def run(args: argparse.Namespace) -> None:
     detection = DetectionEngine(config)
     audio = AudioController(config)
 
-    camera = VideoFileCameraProvider(args.video, loop=True) if args.video else WebcamCameraProvider(device_index=args.camera)
+    camera = (
+        VideoFileCameraProvider(args.video, loop=True)
+        if args.video
+        else NetworkCameraProvider(source=args.stream, fallback_source=args.stream_fallback)
+    )
     sensor = KeyboardDistanceSensor() if args.keyboard_sensor else None
     obstacle_sim = ObstacleSimulator(enabled=args.simulate_obstacles)
     nav_sim = NavigationSimulator(interval_sec=args.nav_interval, enabled=args.simulate_navigation)
@@ -239,7 +246,8 @@ async def run(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="HACKABOT outdoor demo")
-    p.add_argument("--camera", type=int, default=0, help="Webcam index")
+    p.add_argument("--stream", type=str, default=DROIDCAM_PRIMARY, help="DroidCam stream URL")
+    p.add_argument("--stream-fallback", type=str, default=DROIDCAM_FALLBACK, help="DroidCam fallback stream URL")
     p.add_argument("--video", type=str, default="", help="Optional prerecorded video path")
     p.add_argument("--show-overlay", action="store_true", help="Show OpenCV overlay")
     p.add_argument("--no-flip", action="store_true", help="Disable mirrored USER VIEW window")
