@@ -65,9 +65,14 @@ class AudioController:
         if not player:
             return False
         try:
+            args = [player]
+            vol_mult = float(self.config.get("audio", {}).get("volume_multiplier", 1.0))
+            # macOS afplay supports -v (linear multiplier). Keep bounded to avoid clipping.
+            if Path(player).name == "afplay" and vol_mult != 1.0:
+                args.extend(["-v", str(max(0.1, min(2.5, vol_mult)))])
+            args.append(str(path))
             proc = await asyncio.create_subprocess_exec(
-                player,
-                str(path),
+                *args,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
@@ -99,6 +104,34 @@ class AudioController:
                 await self._worker_task
             except asyncio.CancelledError:
                 pass
+
+    def drop_pending(self, *, mode: str | None = None) -> int:
+        """Drop queued (not yet playing) items. Returns number removed."""
+        removed = 0
+        kept: list[QueueItem] = []
+        while True:
+            try:
+                item = self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+            if mode is not None and item.event.mode != mode:
+                kept.append(item)
+            else:
+                removed += 1
+                self._log_event(
+                    mode=item.event.mode,
+                    key=item.event.key,
+                    priority=item.event.priority,
+                    status="dropped_pending",
+                    reason="sync_latest",
+                    file_path="",
+                )
+            self.queue.task_done()
+
+        for item in kept:
+            self.queue.put_nowait(item)
+        return removed
 
     def enqueue(
         self,
