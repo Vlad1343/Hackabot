@@ -90,6 +90,8 @@ class NetworkCameraProvider(CameraProvider):
         self.source = source
         self.fallback_source = fallback_source
         self.camera = CameraSource(source=source)
+        self._read_task: Optional[asyncio.Task] = None
+        self._read_started_at = 0.0
 
     async def start(self) -> None:
         if cv2 is None:
@@ -106,11 +108,34 @@ class NetworkCameraProvider(CameraProvider):
                     f"{self.source}"
                     + (f" / {self.fallback_source}" if self.fallback_source else "")
                 )
+        self._read_task = None
+        self._read_started_at = 0.0
 
     async def read(self) -> Optional[np.ndarray]:
-        return await asyncio.to_thread(self.camera.read)
+        now = time.monotonic()
+        # Keep at most one in-flight blocking read to avoid thread pileups/freezes.
+        if self._read_task is None:
+            self._read_started_at = now
+            self._read_task = asyncio.create_task(asyncio.to_thread(self.camera.read))
+            return None
+
+        if not self._read_task.done():
+            # If capture read blocks too long, drop task reference and force reconnect.
+            if now - self._read_started_at > 1.2:
+                print("[CAMERA] read stalled; forcing reconnect")
+                self.camera.reconnect()
+                self._read_task = None
+            return None
+
+        task = self._read_task
+        self._read_task = None
+        try:
+            return task.result()
+        except Exception:
+            return None
 
     async def stop(self) -> None:
+        self._read_task = None
         self.camera.close()
 
 
