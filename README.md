@@ -1,96 +1,162 @@
-# HACKABOT Assistive Navigation
+# Stepwise
 
-Hackathon-ready indoor/outdoor assistive navigation demo with YOLOv8 detection, prioritized audio alerts, cooldown suppression, simulators, and hardware-ready interfaces.
+Stepwise is a real-time assistive navigation system designed for visually impaired users, combining computer vision, embedded sensing, and low-latency wireless communication into a unified safety-first pipeline for indoor and outdoor environments.
 
-## Quick Start
+---
 
-```bash
-cd assistive-navigation
-python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+## How It Works
+
+Stepwise combines two independent inputs into a single decision:
+
+- Camera (via phone): captures the environment and runs YOLOv8 to detect objects and their direction (left, ahead, right)
+- Ultrasonic sensor (via Pico): measures distance to obstacles and determines risk level (SAFE, WARNING, DANGER)
+
+These signals are processed together on the laptop:
+
+- Distance is treated as safety-critical
+- Object detection provides context only
+- When there is a conflict, proximity always takes priority
+
+The final output is converted into audio feedback:
+
+- Voice instructions for objects and direction
+- Beep patterns for immediate danger levels
+
+---
+
+## Stepwise System Flow
+
+1. Camera stream and ultrasonic sensing run in parallel
+2. YOLOv8 detects objects and estimates direction (left, ahead, right)
+3. Ultrasonic pipeline classifies proximity (SAFE, WARNING, DANGER)
+4. Decision layer prioritises safety state over visual semantics
+5. Audio engine emits controlled, non-overlapping feedback (voice + tones)
+6. Logging layer maintains visibility for debugging and system stability
+
+---
+
+## Core Features
+
+- Real-time assistive perception for indoor and outdoor mobility
+- YOLOv8-based object detection with directional awareness
+- Ultrasonic hazard detection with immediate risk classification
+- Sensor fusion with strict safety-first prioritisation
+- Anti-spam audio system (cooldowns, de-duplication, event gating)
+- Robust camera streaming with automatic recovery
+- Modular architecture for vision, sensing, and feedback layers
+- Wireless fail-safe design with packet validation and fallback logic
+
+---
+
+## System Architecture
+
+### Architecture Modes
+
+| Mode | Data Path | Purpose |
+|---|---|---|
+| Demo runtime (current) | HC-SR04 -> Pico (sensor + classification) -> USB Serial -> Laptop -> Audio + Visual Output | Fast setup for controlled demos and development |
+| Target wireless runtime | HC-SR04 -> Pico 1 -> nRF24L01 link -> Pico 2 -> USB Serial -> Laptop feedback system | Field-oriented reliability and wireless decoupling |
+
+### Two-Pico Node Responsibilities
+
+| Node | Responsibility | Why it matters |
+|---|---|---|
+| Pico 1 (sensor node) | Real-time sensing and immediate risk classification | Keeps proximity decisions low-latency at the edge |
+| Pico 2 (gateway node) | Wireless reliability checks, packet validation, stable forwarding to laptop | Prevents noisy RF conditions from destabilising user feedback |
+
+### End-to-End Safety Pipeline
+
+```text
+Sensor Plane   : HC-SR04 -> Pico 1 classification
+Transport Plane: nRF24L01 link -> Pico 2 validation -> USB Serial
+Compute Plane  : Laptop fusion engine (vision + risk priority)
+Output Plane   : Voice guidance + danger beeps + visual overlay
 ```
 
-Generate audio (required before first run; use pyttsx3 for offline demo):
+---
 
-```bash
-python generate_pyttsx3_audio.py --mode all --overwrite
-```
+## Vision + Safety Fusion
 
-YOLOv8 nano weights (`yolov8n.pt`) are downloaded automatically on first detection run.
+| Input Stream | Processing | Output Signal |
+|---|---|---|
+| Phone camera (DroidCam) | YOLOv8 inference | Directional semantic events |
+| Ultrasonic sensor | Risk classification | Safety state (SAFE/WARNING/DANGER) |
 
-## Run Indoor Demo
+Fusion rule: safety state always has priority when semantic and proximity signals conflict.
 
-```bash
-python indoor_demo.py --show-overlay --keyboard-sensor --simulate-navigation
-```
+Final output: prioritised audio feedback (voice + tones).
 
-## Run Outdoor Demo
+---
 
-```bash
-python outdoor_demo.py --show-overlay --keyboard-sensor --simulate-navigation
-```
+## Hardware Stack
 
-## Unified Entry Point
+- Raspberry Pi Pico (dual-node architecture)
+- HC-SR04 ultrasonic distance sensor
+- nRF24L01 wireless modules with external antennas
+- 3D-printed phone case + integrated mounting enclosure
+- Voltage level shifting for safe GPIO interfacing
+- Optional power stabilisation capacitors for RF reliability
 
-```bash
-python main.py --mode indoor --show-overlay
-python main.py --mode outdoor --video /path/to/video.mp4 --show-overlay
-```
+---
 
-Recommended quick commands:
+## Software Stack
 
-```bash
-./run_indoor.sh
-./run_outdoor.sh
-```
+- Python-based orchestration and runtime control
+- OpenCV video ingestion and frame handling
+- Ultralytics YOLOv8 for real-time object detection
+- Audio engine (voice prompts + tone-based alerts)
+- Serial communication bridge (Pico telemetry)
+- Wireless diagnostics and RF monitoring
 
-## Keyboard Sensor Controls
+---
 
-When `--keyboard-sensor` is enabled:
-- `o` + Enter: obstacle approaching
-- `c` + Enter: obstacle very close
-- `q` + Enter: stop keyboard sensor thread
+## Audio & Feedback Logic
 
-## Audio Generation
+The system enforces a strict single-channel output model:
 
-Offline generation (fast demo fallback):
+- No overlapping audio events
+- Cooldown-based repetition control
+- Priority order: DANGER > WARNING > SAFE
 
-```bash
-python generate_pyttsx3_audio.py --mode all --overwrite
-```
+### Output Types
 
-ElevenLabs generation:
+- Directional voice cues (object + position)
+- Safety tones mapped to risk level
+- Event suppression during high-frequency detection bursts
 
-```bash
-# .env must include ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID
-python generate_elevenlabs_audio.py --mode all --overwrite
-```
+---
 
-## Notes
+## Reliability Engineering
 
-- Audio events are logged to `assistive-navigation/logs/audio_events.csv`.
-- Missing audio files are reported but do not crash the pipeline.
-- Replace `PiCameraProviderStub` and `DistanceSensor` implementations for hardware without changing core demo logic.
+Stepwise is designed for unstable real-world conditions:
 
-## Two-Pico Embedded MVP (Hackathon Path)
+- Automatic camera reconnection on stream failure
+- Serial port recovery for Pico re-enumeration
+- RF packet validation (MAX_RT, NO_SIGNAL)
+- Temporal smoothing of sensor noise
+- Debounce logic for unstable ultrasonic readings
+- Logging layer for traceability of system state
 
-Added standalone files in `assistive-navigation/`:
-- `pico_a_sensor_node.py` (MicroPython): HC-SR04 -> classify -> nRF24 TX
-- `pico_b_relay_node.py` (MicroPython): nRF24 RX -> USB serial relay
-- `laptop_relay_monitor.py` (Python): serial -> text/voice output
+---
 
-### Run Order
+## Indoor vs Outdoor Behaviour
 
-1. Flash `pico_a_sensor_node.py` to Pico A (`main.py`) and wire HC-SR04 (+ voltage divider on ECHO).
-2. Flash `pico_b_relay_node.py` to Pico B (`main.py`) and wire nRF24.
-3. On laptop:
+- Indoor: close-range obstacle avoidance (people, furniture, walls)
+- Outdoor: dynamic hazards (traffic, crossings, moving objects)
+- Core rule: proximity overrides semantics
 
-```bash
-cd assistive-navigation
-source ../.venv/bin/activate
-pip install -r requirements.txt
-python laptop_relay_monitor.py --port /dev/tty.usbmodemXXXX --voice
-```
+---
 
-If you start with one sensor, set `USE_THREE_SENSORS = False` in `pico_a_sensor_node.py`.
+## Project Gallery
+
+<p align="center">
+	<img src="photos/1.png" alt="Stepwise Prototype 1" width="250" />
+</p>
+
+<p align="center">
+	<img src="photos/2.png" alt="Stepwise Prototype 2" width="250" />
+</p>
+
+<p align="center">
+	<img src="photos/3.png" alt="Stepwise Prototype 3" width="1000" />
+</p>
