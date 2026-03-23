@@ -1,6 +1,12 @@
 # Stepwise
 
-Stepwise is a real-time assistive navigation system designed for visually impaired users, combining computer vision, embedded sensing, and low-latency wireless communication into a unified safety-first pipeline for indoor and outdoor environments.
+> **🥈 2nd Place at Hack-A-Bot Creative Challenge** <br>
+> Real-Time Assistive Navigation Project <br>
+> Accessibility-Focused AI System for Safer Mobility (sponsored by **Arm** and **EEESoc**)
+
+---
+
+Stepwise is a **real-time assistive navigation system** designed for **visually impaired users**, combining computer vision, embedded sensing, and low-latency wireless communication into a unified **safety-first pipeline** for indoor and outdoor environments.
 
 ---
 
@@ -8,19 +14,19 @@ Stepwise is a real-time assistive navigation system designed for visually impair
 
 Stepwise combines two independent inputs into a single decision:
 
-- Camera (via phone): captures the environment and runs YOLOv8 to detect objects and their direction (left, ahead, right)
-- Ultrasonic sensor (via Pico): measures distance to obstacles and determines risk level (SAFE, WARNING, DANGER)
+- **Camera** (via phone): captures the environment and runs **YOLOv8** to detect objects and their direction (left, ahead, right)
+- **Ultrasonic sensor** (via Pico): measures distance to obstacles and determines risk level (**SAFE**, **WARNING**, **DANGER**)
 
 These signals are processed together on the laptop:
 
-- Distance is treated as safety-critical
-- Object detection provides context only
-- When there is a conflict, proximity always takes priority
+- **Distance** is treated as safety-critical
+- Object detection provides **context only**
+- When there is a conflict, **proximity always takes priority**
 
 The final output is converted into audio feedback:
 
-- Voice instructions for objects and direction
-- Beep patterns for immediate danger levels
+- **Voice instructions** for objects and direction
+- **Beep patterns** for immediate danger levels
 
 ---
 
@@ -37,14 +43,14 @@ The final output is converted into audio feedback:
 
 ## Core Features
 
-- Real-time assistive perception for indoor and outdoor mobility
-- YOLOv8-based object detection with directional awareness
-- Ultrasonic hazard detection with immediate risk classification
-- Sensor fusion with strict safety-first prioritisation
-- Anti-spam audio system (cooldowns, de-duplication, event gating)
-- Robust camera streaming with automatic recovery
-- Modular architecture for vision, sensing, and feedback layers
-- Wireless fail-safe design with packet validation and fallback logic
+- **Real-time assistive perception** for indoor and outdoor mobility
+- **YOLOv8-based object detection** with directional awareness
+- **Ultrasonic hazard detection** with immediate risk classification
+- **Sensor fusion** with strict safety-first prioritisation
+- **Anti-spam audio system** (cooldowns, de-duplication, event gating)
+- **Robust camera streaming** with automatic recovery
+- **Modular architecture** for vision, sensing, and feedback layers
+- **Wireless fail-safe design** with packet validation and fallback logic
 
 ---
 
@@ -82,9 +88,9 @@ Output Plane   : Voice guidance + danger beeps + visual overlay
 | Phone camera (DroidCam) | YOLOv8 inference | Directional semantic events |
 | Ultrasonic sensor | Risk classification | Safety state (SAFE/WARNING/DANGER) |
 
-Fusion rule: safety state always has priority when semantic and proximity signals conflict.
+Fusion rule: **safety state always has priority** when semantic and proximity signals conflict.
 
-Final output: prioritised audio feedback (voice + tones).
+Final output: **prioritised audio feedback** (voice + tones).
 
 ---
 
@@ -112,11 +118,11 @@ Final output: prioritised audio feedback (voice + tones).
 
 ## Audio & Feedback Logic
 
-The system enforces a strict single-channel output model:
+The system enforces a **strict single-channel output model**:
 
-- No overlapping audio events
-- Cooldown-based repetition control
-- Priority order: DANGER > WARNING > SAFE
+- **No overlapping audio events**
+- **Cooldown-based repetition control**
+- **Priority order**: DANGER > WARNING > SAFE
 
 ### Output Types
 
@@ -128,22 +134,22 @@ The system enforces a strict single-channel output model:
 
 ## Reliability Engineering
 
-Stepwise is designed for unstable real-world conditions:
+Stepwise is designed for **unstable real-world conditions**:
 
-- Automatic camera reconnection on stream failure
-- Serial port recovery for Pico re-enumeration
-- RF packet validation (MAX_RT, NO_SIGNAL)
-- Temporal smoothing of sensor noise
-- Debounce logic for unstable ultrasonic readings
-- Logging layer for traceability of system state
+- **Automatic camera reconnection** on stream failure
+- **Serial port recovery** for Pico re-enumeration
+- **RF packet validation** (MAX_RT, NO_SIGNAL)
+- **Temporal smoothing** of sensor noise
+- **Debounce logic** for unstable ultrasonic readings
+- **Logging layer** for traceability of system state
 
 ---
 
 ## Indoor vs Outdoor Behaviour
 
-- Indoor: close-range obstacle avoidance (people, furniture, walls)
-- Outdoor: dynamic hazards (traffic, crossings, moving objects)
-- Core rule: proximity overrides semantics
+- **Indoor**: close-range obstacle avoidance (people, furniture, walls)
+- **Outdoor**: dynamic hazards (traffic, crossings, moving objects)
+- **Core rule**: proximity overrides semantics
 
 ---
 
