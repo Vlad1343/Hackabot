@@ -1,8 +1,8 @@
 # Stepwise
 
 > **🥈 2nd Place at Hack-A-Bot Creative Challenge** <br>
-> Real-Time Assistive Navigation Project <br>
-> Accessibility-Focused AI System for Safer Mobility (sponsored by **Arm** and **EEESoc**)
+> – Real-Time Assistive Navigation Project <br>
+> – Accessibility-Focused AI System for Safer Mobility (sponsored by **Arm** and **EEESoc**)
 
 ---
 
