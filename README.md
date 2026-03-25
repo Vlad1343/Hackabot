@@ -145,7 +145,7 @@ Stepwise is designed for **unstable real-world conditions**:
 
 ---
 
-## Indoor vs Outdoor Behaviour
+## Indoor and Outdoor Behaviour
 
 - **Indoor**: close-range obstacle avoidance (people, furniture, walls)
 - **Outdoor**: dynamic hazards (traffic, crossings, moving objects)
