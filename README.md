@@ -99,7 +99,7 @@ Final output: **prioritised audio feedback** (voice + tones).
 - Raspberry Pi Pico (dual-node architecture)
 - HC-SR04 ultrasonic distance sensor
 - nRF24L01 wireless modules with external antennas
-- 3D-printed phone case + integrated mounting enclosure
+- Custom-made 3D-printed phone case + integrated mounting enclosure
 - Voltage level shifting for safe GPIO interfacing
 - Optional power stabilisation capacitors for RF reliability
 
