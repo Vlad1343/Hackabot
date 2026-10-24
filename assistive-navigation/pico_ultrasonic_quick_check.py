@@ -1,22 +1,19 @@
 """
 Pico HC-SR04 quick distance test (MicroPython).
 
-How to use:
-1) Copy this file to Raspberry Pi Pico as main.py (or run manually from REPL).
-2) Wire HC-SR04:
-   - VCC -> 5V
-   - GND -> GND
-   - TRIG -> Pico GP2  (default below)
-   - ECHO -> Pico GP3  (default below) THROUGH VOLTAGE DIVIDER to 3.3V
-3) Open serial console and read printed distances.
+Serial output intentionally matches Arduino-like format so laptop tools can parse:
+- "Distance: <value> cm"
+- "No reading"
 """
 
 from machine import Pin, time_pulse_us
 import utime
 
 # Change these pins if your wiring is different.
-TRIG_PIN = 2
-ECHO_PIN = 3
+# Default matches your previously working Arduino sketch:
+#   TRIG_PIN=3, ECHO_PIN=2
+TRIG_PIN = 3
+ECHO_PIN = 2
 
 # Thresholds for simple state classification.
 DANGER_CM = 30.0
@@ -62,7 +59,7 @@ def median3(a, b, c):
     return vals[1]
 
 
-print("Pico HC-SR04 quick check started")
+print("HC-SR04 test starting...")
 print("TRIG=GP{}, ECHO=GP{}".format(TRIG_PIN, ECHO_PIN))
 
 while True:
@@ -80,11 +77,9 @@ while True:
     else:
         d_filtered = None
 
-    state = classify(d_filtered)
     if d_filtered is None:
-        print("distance=None state={}".format(state))
+        print("No reading")
     else:
-        print("distance={:.1f}cm state={}".format(d_filtered, state))
+        print("Distance: {:.1f} cm".format(d_filtered))
 
-    utime.sleep_ms(200)
-
+    utime.sleep_ms(500)

@@ -22,22 +22,23 @@ except Exception:
 # -----------------------------
 # Config (edit for your wiring)
 # -----------------------------
-USE_THREE_SENSORS = True
+USE_THREE_SENSORS = False
 
 # HC-SR04 pins (BCM-like GP numbers for Pico)
-TRIG_FRONT = 2
-ECHO_FRONT = 3
+TRIG_FRONT = 3
+ECHO_FRONT = 2
 TRIG_LEFT = 4
 ECHO_LEFT = 5
 TRIG_RIGHT = 6
 ECHO_RIGHT = 7
 
 # Distance thresholds (cm)
-DANGER_CM = 30.0
-SAFE_CM = 100.0
+# > 120 = SAFE, 50..120 = WARNING, < 50 = DANGER
+DANGER_CM = 50.0
+SAFE_CM = 120.0
 
 # Timing
-LOOP_MS = 100  # ~10Hz
+LOOP_MS = 150  # ~6-7Hz (more stable for radio + sensor)
 ECHO_TIMEOUT_US = 30000
 
 # nRF24 pins/settings
@@ -48,6 +49,7 @@ MISO_PIN = 16
 CE_PIN = 20
 CSN_PIN = 17
 CHANNEL = 108
+SPI_BAUD = 1000000
 
 PIPE_TX = b"\xe1\xf0\xf0\xf0\xf0"
 PIPE_RX = b"\xd2\xf0\xf0\xf0\xf0"
@@ -116,7 +118,7 @@ def main():
 
     spi = SPI(
         SPI_ID,
-        baudrate=4000000,
+        baudrate=SPI_BAUD,
         polarity=0,
         phase=0,
         sck=Pin(SCK_PIN),
@@ -153,4 +155,3 @@ def main():
 
 
 main()
-

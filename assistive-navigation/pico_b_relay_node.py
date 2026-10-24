@@ -28,6 +28,7 @@ MISO_PIN = 16
 CE_PIN = 20
 CSN_PIN = 17
 CHANNEL = 108
+SPI_BAUD = 1000000
 
 PIPE_TX = b"\xd2\xf0\xf0\xf0\xf0"
 PIPE_RX = b"\xe1\xf0\xf0\xf0\xf0"
@@ -38,7 +39,7 @@ NO_SIGNAL_TIMEOUT_MS = 1500
 def main():
     spi = SPI(
         SPI_ID,
-        baudrate=4000000,
+        baudrate=SPI_BAUD,
         polarity=0,
         phase=0,
         sck=Pin(SCK_PIN),
@@ -74,4 +75,3 @@ def main():
 
 
 main()
-
